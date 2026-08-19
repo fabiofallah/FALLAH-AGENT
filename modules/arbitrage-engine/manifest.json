@@ -1,0 +1,9 @@
+{
+  "id": "arbitrage-engine",
+  "name": "ARBITRAGE ENGINE",
+  "version": "2.0.1",
+  "primary": true,
+  "status": "prepared",
+  "logicImplemented": false,
+  "areas": ["casas", "readers", "discovery", "mercados", "normalizacao", "engine", "sure-bets", "robo", "logs", "configuracoes"]
+}

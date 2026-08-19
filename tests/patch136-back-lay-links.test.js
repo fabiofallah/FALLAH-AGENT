@@ -1,0 +1,14 @@
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const { normalizePayload } = require('../src/services/pipeline/normalizerService');
+const payload={events:[{id:'3410',name:'IFK Ostersund - Degerfors IF','event-participants':[{'id':'P1','participant-name':'Degerfors IF'}],markets:[{id:'M1',name:'Resultado da Partida',runners:[{id:'R1','event-participant-id':'P1',prices:[{side:'lay',odds:1.02,'available-amount':50},{side:'back',odds:1.01,'available-amount':80}]}]}]}]};
+const rec=normalizePayload(payload,{houseId:'BETBRA',readerId:'BETBRA',endpoint:'https://mexchange-api.betbra.bet.br/api/events'})[0];
+assert.equal(rec.prices.back,1.02,'raw maker LAY must map to UI/action BACK');
+assert.equal(rec.prices.lay,1.01,'raw maker BACK must map to UI/action LAY');
+const engine=fs.readFileSync(path.join(__dirname,'../src/services/arbitrageEngineService.js'),'utf8');
+assert(engine.includes('https://betbra.bet.br/b/exchange/events/'),'Betbra public event route missing');
+assert(engine.includes('https://fulltbet.bet.br/b/exchange/events/'),'Fulltbet public event route missing');
+const ui=fs.readFileSync(path.join(__dirname,'../src/public/fallah-engine.js'),'utf8');
+assert(!ui.includes('>FONTE API <'),'API button must not be operator-facing');
+console.log('PATCH_136 PASS: BACK/LAY action semantics + public links + no API button');

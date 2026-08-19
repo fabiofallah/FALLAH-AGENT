@@ -1,0 +1,3204 @@
+const crypto = require('crypto');
+const os = require('os');
+const fs = require('fs-extra');
+const path = require('path');
+const { ReaderGeneratorService } = require('./pipeline/readerGeneratorService');
+const { EngineDataService } = require('./pipeline/engineDataService');
+const { CoverageMonitorService } = require('./pipeline/coverageMonitorService');
+const { normalizePayload } = require('./pipeline/normalizerService');
+
+// Persistent health log shared across all readers — survives Electron restarts
+const CRASH_LOG_ROOT = process.env.FALLAH_CRASH_LOG_ROOT || 'C:\\FALLAH_AGENT_TRABALHO\\CRASH_LOGS';
+const PATCH_TAG = 'PATCH_138';
+const MASTER_LOG_PATH = path.join(CRASH_LOG_ROOT, `${PATCH_TAG}_MASTER.log`);
+const RUN_STATE_PATH = path.join(CRASH_LOG_ROOT, `${PATCH_TAG}_RUN_STATE.json`);
+const MAX_HEAVY_LIVE_CYCLES = Math.max(1, Number(process.env.MAX_HEAVY_LIVE_CYCLES || 2));
+
+// PATCH 113.1 — bootstrap em blocos de 5.
+// Ordem oficial baseada na ordem real observada pelo usuário.
+const BOOTSTRAP_GROUPS = [
+  ['FULLTBET', 'BETFAIR', 'BETBRA'],
+];
+const BOOTSTRAP_GROUP_TIMEOUT_MS = Math.max(30000, Number(process.env.FALLAH_BOOTSTRAP_GROUP_TIMEOUT_MS || 60000));
+
+// Até 5 coletas pesadas quando há folga de RAM; reduz automaticamente se a memória subir.
+const ADAPTIVE_FIVE_SLOT_RSS_BYTES = Math.max(1024, Number(process.env.FALLAH_ADAPTIVE_FIVE_SLOT_RSS_MB || 550)) * 1048576;
+const ADAPTIVE_THREE_SLOT_RSS_BYTES = Math.max(1400, Number(process.env.FALLAH_ADAPTIVE_THREE_SLOT_RSS_MB || 650)) * 1048576;
+const ADAPTIVE_TWO_SLOT_RSS_BYTES = Math.max(1800, Number(process.env.FALLAH_ADAPTIVE_TWO_SLOT_RSS_MB || 750)) * 1048576;
+const ADAPTIVE_ONE_SLOT_RSS_BYTES = Math.max(2200, Number(process.env.FALLAH_ADAPTIVE_ONE_SLOT_RSS_MB || 850)) * 1048576;
+
+const HEALTH_LOG_MAX_BYTES = 24 * 1024 * 1024;
+const PERF_TRACE_ENABLED = process.env.FALLAH_PERF_TRACE === '1';
+const LOOP_TRACE_ENABLED = process.env.FALLAH_LOOP_TRACE === '1';
+
+function appendMaster(category, entry = {}) {
+  try {
+    require('fs').mkdirSync(CRASH_LOG_ROOT, { recursive: true });
+    const line = `${JSON.stringify({ ts: new Date().toISOString(), patch: PATCH_TAG, category, ...entry })}\n`;
+    try {
+      const stat = require('fs').statSync(MASTER_LOG_PATH);
+      if (stat.size > HEALTH_LOG_MAX_BYTES) {
+        require('fs').writeFileSync(MASTER_LOG_PATH, line);
+        return;
+      }
+    } catch {}
+    require('fs').appendFileSync(MASTER_LOG_PATH, line);
+  } catch {}
+}
+
+function writeConnectionDiagnostic(entry) { appendMaster('CONNECTION', entry); }
+function writeCrashLog(event, details = {}) { appendMaster('CRASH', { event, pid: process.pid, ...details }); }
+function writeHealthLog(entry) { appendMaster('READER_HEALTH', entry); }
+
+function writeMemoryLog(event, details = {}) {
+  const usage = process.memoryUsage();
+  const entry = { event, ...details };
+  for (const key of ['heapUsed', 'heapTotal', 'external', 'arrayBuffers', 'rss']) {
+    entry[key] = usage[key];
+    entry[`${key}MB`] = Math.round((usage[key] / 1048576) * 10) / 10;
+  }
+  appendMaster('MEMORY', entry);
+}
+
+function compactMemory() {
+  const usage = process.memoryUsage();
+  return { rss: usage.rss, heap: usage.heapUsed, heapTotal: usage.heapTotal, external: usage.external, arrayBuffers: usage.arrayBuffers };
+}
+
+function appendSchedulerLog(entry) { appendMaster('SCHEDULER', entry); }
+
+class LiveCycleScheduler {
+  constructor(options = {}) {
+    this.max = Math.max(1, Number(options.max || MAX_HEAVY_LIVE_CYCLES));
+    this.active = 0;
+    this.queue = [];
+    this.registeredReaders = new Set();
+    this.bootstrapCompleted = new Set();
+    this.bootstrapCompletedHouses = new Set();
+    this.bootstrapStartedAt = Date.now();
+    this.currentBootstrapGroup = 0;
+    this.groupOpenedAt = Date.now();
+    this.criticalRssBytes = Math.max(0, Number(options.criticalRssBytes ?? process.env.FALLAH_CRITICAL_RSS_MB ?? 4096) * 1048576);
+    this.recoveryMs = Math.max(100, Number(options.recoveryMs || 750));
+  }
+
+  acquire(meta = {}) {
+    const queuedAt = Date.now();
+    const readerKey = String(meta.readerId || meta.houseId || meta.house || 'unknown');
+    this.registeredReaders.add(readerKey);
+    const phase = this.bootstrapCompleted.has(readerKey) ? 'REFRESH' : 'BOOTSTRAP';
+    meta = { ...meta, readerKey, phase };
+    appendSchedulerLog({ ...meta, event: 'QUEUE', queueDepth: this.queue.length + 1, active: this.active });
+    writeConnectionDiagnostic({ ...meta, event: 'WAITING_SCHEDULER', queueDepth: this.queue.length + 1, activeHeavyCycles: this.active, maxHeavyLiveCycles: this.max });
+    return new Promise((resolve) => {
+      this.queue.push({ meta, queuedAt, resolve, readerKey, phase });
+      this.drain();
+    });
+  }
+
+  houseGroupIndex(house) {
+    const normalized = String(house || '').trim().toUpperCase();
+    const index = BOOTSTRAP_GROUPS.findIndex((group) => group.includes(normalized));
+    return index < 0 ? BOOTSTRAP_GROUPS.length : index;
+  }
+
+  maybeAdvanceBootstrapGroup() {
+    while (this.currentBootstrapGroup < BOOTSTRAP_GROUPS.length - 1) {
+      const group = BOOTSTRAP_GROUPS[this.currentBootstrapGroup];
+      const allDone = group.every((house) => this.bootstrapCompletedHouses.has(house));
+      const timedOut = Date.now() - this.groupOpenedAt >= BOOTSTRAP_GROUP_TIMEOUT_MS;
+      if (!allDone && !timedOut) break;
+      appendSchedulerLog({
+        event: 'BOOTSTRAP_GROUP_ADVANCE',
+        fromGroup: this.currentBootstrapGroup + 1,
+        toGroup: this.currentBootstrapGroup + 2,
+        reason: allDone ? 'GROUP_COMPLETED' : 'ONE_MINUTE_TIMEOUT',
+      });
+      this.currentBootstrapGroup += 1;
+      this.groupOpenedAt = Date.now();
+    }
+  }
+
+  effectiveMax() {
+    const rss = process.memoryUsage().rss;
+    if (this._adaptiveMax == null) this._adaptiveMax = 1;
+    if (rss <= ADAPTIVE_FIVE_SLOT_RSS_BYTES) this._adaptiveMax = Math.min(5, this.max);
+    else if (rss <= ADAPTIVE_THREE_SLOT_RSS_BYTES) this._adaptiveMax = Math.min(3, this.max);
+    else if (rss <= ADAPTIVE_TWO_SLOT_RSS_BYTES) this._adaptiveMax = Math.min(2, this.max);
+    else if (rss >= ADAPTIVE_ONE_SLOT_RSS_BYTES) this._adaptiveMax = 1;
+    return Math.max(1, this._adaptiveMax);
+  }
+
+  async drain() {
+    if (!this.queue.length) return;
+    const effectiveMax = this.effectiveMax();
+    if (this.active >= effectiveMax) return;
+    this.maybeAdvanceBootstrapGroup();
+
+    // PATCH 113.1 priority:
+    // 1) retry de bootstrap que falhou/veio vazio;
+    // 2) primeira tentativa das casas do bloco atual de 5;
+    // 3) qualquer outro bootstrap elegível;
+    // 4) refresh.
+    let nextIndex = this.queue.findIndex((item) =>
+      item.phase === 'BOOTSTRAP' &&
+      !this.bootstrapCompleted.has(item.readerKey) &&
+      Number(item.meta?.retryAttempt || 0) > 0 &&
+      this.houseGroupIndex(item.meta?.house) <= this.currentBootstrapGroup
+    );
+    if (nextIndex < 0) {
+      nextIndex = this.queue.findIndex((item) =>
+        item.phase === 'BOOTSTRAP' &&
+        !this.bootstrapCompleted.has(item.readerKey) &&
+        this.houseGroupIndex(item.meta?.house) === this.currentBootstrapGroup
+      );
+    }
+    if (nextIndex < 0) {
+      nextIndex = this.queue.findIndex((item) =>
+        item.phase === 'BOOTSTRAP' &&
+        !this.bootstrapCompleted.has(item.readerKey) &&
+        this.houseGroupIndex(item.meta?.house) <= this.currentBootstrapGroup
+      );
+    }
+    if (nextIndex < 0) {
+      // Não deixa refresh furar a fila de um bloco ainda dentro do primeiro minuto.
+      const pendingCurrentGroup = this.queue.some((item) =>
+        item.phase === 'BOOTSTRAP' &&
+        this.houseGroupIndex(item.meta?.house) === this.currentBootstrapGroup
+      );
+      if (pendingCurrentGroup) return;
+      nextIndex = 0;
+    }
+    const [next] = this.queue.splice(nextIndex, 1);
+    this.active += 1;
+    let before = compactMemory();
+    appendSchedulerLog({ ...next.meta, event: 'ADAPTIVE_CAPACITY', configuredMax: this.max, effectiveMax, active: this.active, queueDepth: this.queue.length, rss: before.rss });
+    if (this.criticalRssBytes && before.rss >= this.criticalRssBytes) {
+      appendSchedulerLog({ ...next.meta, event: 'MEMORY_RECOVERY_WAIT', rssBefore: before.rss, heapBefore: before.heap });
+      await wait(this.recoveryMs);
+      before = compactMemory();
+    }
+    const startedAt = Date.now();
+    appendSchedulerLog({ ...next.meta, event: 'START', queueWaitMs: startedAt - next.queuedAt, rssBefore: before.rss, heapBefore: before.heap });
+    writeConnectionDiagnostic({ ...next.meta, event: 'COLLECTION_STARTED', queueWaitMs: startedAt - next.queuedAt, rssMB: Math.round(before.rss/1048576), heapMB: Math.round(before.heap/1048576) });
+    let released = false;
+    next.resolve((result = 'OK', error = null) => {
+      if (released) return;
+      released = true;
+      const after = compactMemory();
+      this.active -= 1;
+      if (result === 'OK' && next.readerKey) {
+        this.bootstrapCompleted.add(next.readerKey);
+        const completedHouse = String(next.meta?.house || '').trim().toUpperCase();
+        if (completedHouse) this.bootstrapCompletedHouses.add(completedHouse);
+      }
+      appendSchedulerLog({ ...next.meta, event: 'END', durationMs: Date.now() - startedAt, rssBefore: before.rss, rssAfter: after.rss, heapBefore: before.heap, heapAfter: after.heap, result, error: error ? String(error.message || error).slice(0, 240) : null });
+      writeConnectionDiagnostic({ ...next.meta, event: result === 'OK' ? 'COLLECTION_COMPLETED' : 'COLLECTION_FAILED', durationMs: Date.now() - startedAt, result, error: error ? String(error.message || error).slice(0, 500) : null, rssMB: Math.round(after.rss/1048576), heapMB: Math.round(after.heap/1048576), queueDepth: this.queue.length });
+      try {
+        const current = fs.readJsonSync(RUN_STATE_PATH, { throws: false }) || {};
+        fs.writeJsonSync(RUN_STATE_PATH, { ...current, patch: PATCH_TAG, schedulerUpdatedAt: new Date().toISOString(), maxHeavyLiveCycles: this.max, activeHeavyCycles: this.active, queuedHeavyCycles: this.queue.length, bootstrapRegistered: this.registeredReaders.size, bootstrapCompleted: this.bootstrapCompleted.size, lastCycle: { ...next.meta, result } }, { spaces: 2 });
+      } catch {}
+      this.drain();
+    });
+    // Preserve the proven multi-house bootstrap: allow the scheduler to fill available slots.
+    // Memory protection is applied inside endpoint batches, not by blocking house startup.
+    setImmediate(() => this.drain());
+  }
+}
+
+try {
+  fs.ensureDirSync(CRASH_LOG_ROOT);
+  fs.ensureFileSync(MASTER_LOG_PATH);
+  fs.ensureFileSync(path.join(CRASH_LOG_ROOT, `${PATCH_TAG}_INSTALADO.txt`));
+  fs.writeJsonSync(RUN_STATE_PATH, { patch: PATCH_TAG, state: 'RUNNING', pid: process.pid, startedAt: new Date().toISOString(), maxHeavyLiveCycles: MAX_HEAVY_LIVE_CYCLES, active: 0, queued: 0 }, { spaces: 2 });
+  writeConnectionDiagnostic({ event: 'RUNTIME_LOGGING_ACTIVE', pid: process.pid, root: CRASH_LOG_ROOT });
+  appendSchedulerLog({ event: 'BOOTSTRAP_5X5_ACTIVE', groups: BOOTSTRAP_GROUPS, groupTimeoutMs: BOOTSTRAP_GROUP_TIMEOUT_MS, maxHeavyCycles: MAX_HEAVY_LIVE_CYCLES });
+  writeMemoryLog('RUNTIME_STARTED', { pid: process.pid });
+  if (!global.__FALLAH_PATCH92_PROCESS_LOGGERS__) {
+    global.__FALLAH_PATCH92_PROCESS_LOGGERS__ = true;
+    process.on('uncaughtExceptionMonitor', (error, origin) => {
+      writeCrashLog('UNCAUGHT_EXCEPTION', { origin, error: String(error?.stack || error?.message || error).slice(0, 12000) });
+    });
+    process.on('unhandledRejection', (reason) => {
+      writeCrashLog('UNHANDLED_REJECTION', { error: String(reason?.stack || reason?.message || reason).slice(0, 12000) });
+    });
+    process.on('exit', (code) => {
+      try {
+        const current = fs.readJsonSync(RUN_STATE_PATH, { throws: false }) || {};
+        fs.writeJsonSync(RUN_STATE_PATH, { ...current, patch: PATCH_TAG, state: 'EXITED', exitCode: code, exitedAt: new Date().toISOString() }, { spaces: 2 });
+      } catch {}
+    });
+  }
+} catch {}
+
+const liveCycleScheduler = new LiveCycleScheduler();
+
+function structure(value, depth = 0) {
+  if (depth > 5) return 'truncated';
+  if (Array.isArray(value)) return ['array', value.length ? structure(value[0], depth + 1) : 'empty'];
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .slice(0, 100)
+        .map((key) => [key, structure(value[key], depth + 1)])
+    );
+  }
+  return value === null ? 'null' : typeof value;
+}
+
+function normalizeSportName(value) {
+  const text = String(value || '').trim();
+  if (!text) return 'UNKNOWN';
+  if (/^SPORT_\d+$/i.test(text)) return 'UNKNOWN';
+  if (text.toUpperCase() === 'UNKNOWN') return 'UNKNOWN';
+  return text;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeMethod(method) {
+  const value = String(method || 'GET').toUpperCase();
+  return ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(value) ? value : 'GET';
+}
+
+function sanitizeHeaders(headers = {}, options = {}) {
+  // PATCH 92: most readers keep credential-like headers blocked. NOVIBET is a
+  // session-bound public sportsbook API: its captured browser Cookie/Authorization
+  // headers are required to avoid the proven HTTP 403 loop. Values are never logged.
+  const allowSessionHeaders = Boolean(options.allowSessionHeaders);
+  const blocked = allowSessionHeaders ? /token|secret|api[-_]?key/i : /cookie|authorization|token|secret|api[-_]?key/i;
+  const output = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (typeof value !== 'string') continue;
+    if (blocked.test(name)) continue;
+    output[name] = value;
+  }
+  return output;
+}
+
+function parseJsonSafe(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function cloneValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((item) => cloneValue(item));
+  return { ...value };
+}
+
+function toFiniteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseIso(value) {
+  const ts = Date.parse(String(value || ''));
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function updateSearchParam(urlText, name, value) {
+  try {
+    const url = new URL(String(urlText || ''));
+    if (value === null || value === undefined || value === '') url.searchParams.delete(name);
+    else url.searchParams.set(name, String(value));
+    return url.toString();
+  } catch {
+    return urlText;
+  }
+}
+
+function getSearchParam(urlText, name) {
+  try {
+    const url = new URL(String(urlText || ''));
+    return url.searchParams.get(name);
+  } catch {
+    return null;
+  }
+}
+
+function hasSearchParam(urlText, name) {
+  return getSearchParam(urlText, name) !== null;
+}
+
+function dedupeBy(items, keyOf) {
+  const seen = new Set();
+  const output = [];
+  for (const item of items || []) {
+    const key = keyOf(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+  return output;
+}
+
+function stableRecordId(parts) {
+  return crypto.createHash('sha256').update(parts.map((item) => String(item || '')).join('|')).digest('hex').slice(0, 24);
+}
+
+function normalizeBetfairExchangeRequestUrl(urlText = '') {
+  try {
+    const url = new URL(String(urlText || ''));
+    if (/ero\.betfair\.bet\.br/i.test(url.hostname) && /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(url.pathname)) {
+      const locale = String(url.searchParams.get('locale') || '').toLowerCase();
+      if (locale === 'pt_br') url.searchParams.set('locale', 'pt');
+    }
+    return url.toString();
+  } catch {
+    return urlText;
+  }
+}
+
+function extractEventTimes(payload, output = [], depth = 0) {
+  if (depth > 8 || output.length >= 100000) return output;
+  if (Array.isArray(payload)) {
+    for (const item of payload) extractEventTimes(item, output, depth + 1);
+    return output;
+  }
+  if (!payload || typeof payload !== 'object') return output;
+
+  const candidates = [
+    payload.start,
+    payload.startTime,
+    payload.openDate,
+    payload.marketTime,
+    payload.timestamp,
+    payload.updatedAt,
+    payload.updated_at,
+    payload.time,
+  ];
+  for (const value of candidates) {
+    const ts = parseIso(value);
+    if (ts !== null) output.push(ts);
+  }
+
+  for (const child of Object.values(payload)) {
+    if (child && typeof child === 'object') extractEventTimes(child, output, depth + 1);
+  }
+  return output;
+}
+
+function looksNonSportsEndpoint(urlText = '') {
+  const raw = String(urlText || '');
+  let target = raw;
+  try {
+    const parsed = new URL(raw);
+    target = `${parsed.hostname}${parsed.pathname}`;
+  } catch {
+    target = raw.split('?')[0];
+  }
+  return /translation|bundle\/translations|consent|onetrust|clarity|facebook|trafficguard|metadata|footer|header|siteconfigs|scripttemplates|analytics|tagmanager|gtm|cookie|casino|slots?|bingo|live-?casino|cdn-cgi\/rum|gamingservices|countryrecommendedgames|usersessionstate|navigation\/submenu|navigation\/menu|featureflag|sentry\.io|envelope\/|taboola|doubleclick|googlesyndication|adservice|telemetry|pixel/.test(target.toLowerCase());
+}
+
+function buildSyntheticExchangeEndpointsFromReader(reader = {}) {
+  const endpointUrls = (reader.endpoints || []).map((item) => String(item?.url || '')).filter(Boolean);
+  let hostname = '';
+  for (const endpointUrl of endpointUrls) {
+    try {
+      hostname = String(new URL(endpointUrl).hostname || '').replace(/^www\./i, '');
+      if (hostname) break;
+    } catch {
+      // ignore invalid URL
+    }
+  }
+  if (!hostname) return [];
+
+  const apiHost = /^mexchange-api\./i.test(hostname)
+    ? hostname
+    : `mexchange-api.${hostname}`;
+  const base = `https://${apiHost}/api/events`;
+  const template = (url, score) => ({
+    url,
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+    body: null,
+    requestPayload: null,
+    queryParameters: {},
+    marketIds: [],
+    responseStructures: [],
+    utilityScore: score,
+  });
+
+  return [
+    template(`${base}?offset=0&per-page=100&sort-by=start&sort-direction=asc&after=0&before=4102444800&markets-limit=30`, 90),
+    template(`${base}?offset=0&per-page=100&sort-by=volume&sort-direction=desc&after=0&before=4102444800&markets-limit=30`, 85),
+  ];
+}
+
+function endpointHasStaticEntityIds(endpoint = {}) {
+  const url = String(endpoint.url || '');
+  const query = endpoint.queryParameters || {};
+  const candidates = [
+    getSearchParam(url, 'marketIds'),
+    getSearchParam(url, 'eventIds'),
+    getSearchParam(url, 'selectionIds'),
+    query.marketIds,
+    query.eventIds,
+    query.selectionIds,
+  ];
+  return candidates.some((value) => {
+    if (value === null || value === undefined) return false;
+    const text = String(value).trim();
+    if (!text) return false;
+    if (/\{\{|\$\{|<.+>/.test(text)) return false;
+    return /[,0-9a-f]/i.test(text);
+  });
+}
+
+function looksLikeCatalogEndpoint(endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  const score = Number(endpoint.utilityScore || 0);
+  const method = normalizeMethod(endpoint.method);
+  const structureText = JSON.stringify(endpoint.responseStructures || []).toLowerCase();
+  const queryText = JSON.stringify(endpoint.queryParameters || {}).toLowerCase();
+  const hasPagination = endpointHasPaginationHints(endpoint);
+  const hasStaticIds = endpointHasStaticEntityIds(endpoint);
+  if (score < 10) return false;
+  if (!['GET', 'POST'].includes(method)) return false;
+  if (looksNonSportsEndpoint(url)) return false;
+  if (/bundle\/images|svg|png|jpg|jpeg|css|js\b/.test(url)) return false;
+  if (hasStaticIds && !hasPagination && !/eventtypes|navigation|facet|competitions|events|fixtures/.test(url)) return false;
+  return (
+    /sports?|eventtypes?|competitions?|events?|fixtures?|markets?|inplay|navigation|facet/.test(url) ||
+    /sports?|competitions?|events?|fixtures?|markets?|eventnodes?|marketnodes?/.test(structureText) ||
+    /offset|cursor|page|before|after|eventtypes?|competitions?/.test(queryText)
+  );
+}
+
+function buildOperationalWindow(reader = {}, options = {}) {
+  const timezone = 'America/Sao_Paulo';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const year = Number(parts.find((item) => item.type === 'year')?.value || 0);
+  const month = Number(parts.find((item) => item.type === 'month')?.value || 0);
+  const day = Number(parts.find((item) => item.type === 'day')?.value || 0);
+
+  const timezoneOffsetMs = (timestamp) => {
+    const offsetParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).formatToParts(new Date(timestamp));
+    const localYear = Number(offsetParts.find((item) => item.type === 'year')?.value || 0);
+    const localMonth = Number(offsetParts.find((item) => item.type === 'month')?.value || 0);
+    const localDay = Number(offsetParts.find((item) => item.type === 'day')?.value || 0);
+    const localHour = Number(offsetParts.find((item) => item.type === 'hour')?.value || 0);
+    const localMinute = Number(offsetParts.find((item) => item.type === 'minute')?.value || 0);
+    const localSecond = Number(offsetParts.find((item) => item.type === 'second')?.value || 0);
+    const localAsUtc = Date.UTC(localYear, localMonth - 1, localDay, localHour, localMinute, localSecond);
+    return localAsUtc - timestamp;
+  };
+
+  const zonedMidnightToUtc = (y, m, d) => {
+    const utcGuess = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
+    const offset = timezoneOffsetMs(utcGuess);
+    return utcGuess - offset;
+  };
+
+  const from = zonedMidnightToUtc(year, month, day);
+  const to = zonedMidnightToUtc(year, month, day + 2) - 1;
+  return {
+    now: Date.now(),
+    from,
+    to,
+    windowMs: Math.max(0, to - from),
+    mode: 'today_tomorrow',
+    timezone,
+  };
+}
+
+function endpointHasPaginationHints(endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  const qp = endpoint.queryParameters || {};
+  const keys = new Set([
+    ...Object.keys(qp || {}).map((k) => String(k).toLowerCase()),
+  ]);
+  for (const name of ['offset', 'page', 'per-page', 'per_page', 'limit', 'before', 'after', 'cursor', 'next']) {
+    if (keys.has(name) || hasSearchParam(url, name)) return true;
+  }
+  return false;
+}
+
+function chunk(items, size) {
+  const output = [];
+  const step = Math.max(1, Number(size) || 1);
+  for (let index = 0; index < items.length; index += step) {
+    output.push(items.slice(index, index + step));
+  }
+  return output;
+}
+
+function parsePositiveLimit(value, fallback = Number.POSITIVE_INFINITY) {
+  if (value === null || value === undefined || value === '' || value === 'all' || value === 'ALL') return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function extractMarketIdsFromPayload(payload, output = new Set(), depth = 0) {
+  const maxDynamicMarketIds = parsePositiveLimit(process.env.FALLAH_MAX_DYNAMIC_MARKET_IDS, Number.POSITIVE_INFINITY);
+  if (depth > 8 || (Number.isFinite(maxDynamicMarketIds) && output.size >= maxDynamicMarketIds)) return output;
+  if (Array.isArray(payload)) {
+    for (const item of payload) extractMarketIdsFromPayload(item, output, depth + 1);
+    return output;
+  }
+  if (!payload || typeof payload !== 'object') return output;
+
+  const directIds = [
+    payload.marketId,
+    payload.market_id,
+  ];
+  for (const value of directIds) {
+    const text = String(value || '').trim();
+    if (!text) continue;
+    if (/^\d+(?:\.\d+)?$/.test(text) || /[a-f0-9]{16,}/i.test(text)) output.add(text);
+  }
+
+  if (Array.isArray(payload.markets)) {
+    for (const market of payload.markets) {
+      const value = String(market?.id || market?.marketId || market?.market_id || '').trim();
+      if (value) output.add(value);
+    }
+  } else if (payload.markets && typeof payload.markets === 'object') {
+    for (const [key, market] of Object.entries(payload.markets)) {
+      const value = String(market?.id || market?.marketId || market?.market_id || key || '').trim();
+      if (value) output.add(value);
+    }
+  }
+
+  if (payload.attachments?.markets && typeof payload.attachments.markets === 'object') {
+    for (const [key, market] of Object.entries(payload.attachments.markets)) {
+      const value = String(market?.marketId || market?.id || key || '').trim();
+      if (value) output.add(value);
+    }
+  }
+  if (Array.isArray(payload.marketNodes)) {
+    for (const node of payload.marketNodes) {
+      const value = String(node?.marketId || node?.id || node?.description?.marketId || '').trim();
+      if (value) output.add(value);
+    }
+  }
+  if (Array.isArray(payload.eventNodes)) {
+    for (const eventNode of payload.eventNodes) {
+      extractMarketIdsFromPayload(eventNode, output, depth + 1);
+    }
+  }
+  if (Array.isArray(payload.eventTypes)) {
+    for (const eventType of payload.eventTypes) {
+      extractMarketIdsFromPayload(eventType, output, depth + 1);
+    }
+  }
+  return output;
+}
+
+function upsertCatalogEntry(collection, id, value) {
+  const key = String(id || '').trim();
+  if (!key) return null;
+  const current = collection[key] || {};
+  const next = { ...current };
+  const isTechnicalPlaceholder = (input) => /^SPORT_\d+$/i.test(String(input || '').trim());
+  for (const [field, incoming] of Object.entries(value || {})) {
+    const currentValue = current[field];
+    const incomingText = typeof incoming === 'string' ? incoming.trim() : incoming;
+    const currentText = typeof currentValue === 'string' ? currentValue.trim() : currentValue;
+    const incomingMeaningful = incomingText !== null && incomingText !== undefined && incomingText !== '' && String(incomingText).toUpperCase() !== 'UNKNOWN' && !isTechnicalPlaceholder(incomingText);
+    const currentMeaningful = currentText !== null && currentText !== undefined && currentText !== '' && String(currentText).toUpperCase() !== 'UNKNOWN' && !isTechnicalPlaceholder(currentText);
+    if (incomingMeaningful || !currentMeaningful) next[field] = incoming;
+  }
+  collection[key] = { ...next, id: key };
+  return collection[key];
+}
+
+function collectFacetCatalog(payload, snapshot) {
+  const eventTypes = payload?.attachments?.eventTypes || {};
+  const facets = payload?.facets?.[0]?.values || [];
+  for (const sportNode of facets) {
+    const sportId = String(sportNode?.key?.eventTypeId || '').trim();
+    if (!sportId) continue;
+    const sportName = eventTypes[sportId]?.name || 'UNKNOWN';
+    upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+    for (const competitionNode of sportNode?.next?.values || []) {
+      const competitionId = String(competitionNode?.key?.competitionId || '').trim();
+      if (!competitionId) continue;
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionNode?.key?.competitionName || null });
+      for (const eventNode of competitionNode?.next?.values || []) {
+        const eventId = String(eventNode?.key?.eventId || '').trim();
+        if (!eventId) continue;
+        upsertCatalogEntry(snapshot.events, eventId, { sportId, competitionId, name: eventNode?.key?.eventName || null });
+        for (const marketNode of eventNode?.next?.values || []) {
+          const marketId = String(marketNode?.key?.marketId || '').trim();
+          if (!marketId) continue;
+          upsertCatalogEntry(snapshot.markets, marketId, { sportId, competitionId, eventId, name: marketNode?.key?.marketName || null });
+        }
+      }
+    }
+  }
+}
+
+function collectSportsMenuCatalog(payload, snapshot) {
+  if (!Array.isArray(payload)) return;
+  for (const item of payload) {
+    const sportId = String(item?.sportId ?? item?.id ?? '').trim();
+    const sportName = String(item?.name || item?.englishName || '').trim();
+    if (!sportId || !sportName) continue;
+    // Universal: não limitar a coleta a uma allowlist fixa de modalidades.
+    // Removemos apenas pseudo-itens de navegação que não representam um esporte real.
+    const normalizedSportMenuName = sportName
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    if (['all sports', 'todos os esportes', 'sports', 'esportes', 'live', 'ao vivo', 'popular', 'favorites', 'favourites', 'favoritos'].includes(normalizedSportMenuName)) continue;
+    upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+  }
+}
+
+function collectStructuredCatalog(payload, snapshot) {
+  if (Array.isArray(payload?.eventTypes)) {
+    for (const eventType of payload.eventTypes) {
+      const sportId = String(eventType?.id || eventType?.eventTypeId || eventType?.eventType?.id || '').trim() || `sport:${String(eventType?.name || eventType?.eventType?.name || 'UNKNOWN').trim()}`;
+      const sportName = String(eventType?.name || eventType?.eventType?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+      upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+      for (const eventNode of eventType?.eventNodes || []) {
+        const event = eventNode?.event || {};
+        const competitionId = String(event?.competition?.id || eventNode?.competitionId || event?.competitionId || '').trim() || `competition:${sportId}:${String(event?.competitionName || event?.competition?.name || 'UNKNOWN').trim()}`;
+        const competitionName = String(event?.competitionName || event?.competition?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+        upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+        const eventId = String(eventNode?.eventId || event?.id || '').trim();
+        if (!eventId) continue;
+        upsertCatalogEntry(snapshot.events, eventId, { sportId, competitionId, name: event?.name || null, startTime: event?.openDate || event?.startTime || null, status: event?.inPlayBettingStatus || null });
+        for (const marketNode of eventNode?.marketNodes || []) {
+          const market = marketNode?.description || {};
+          const marketId = String(marketNode?.marketId || market?.marketId || marketNode?.id || '').trim();
+          if (!marketId) continue;
+          upsertCatalogEntry(snapshot.markets, marketId, { sportId, competitionId, eventId, name: market?.marketName || marketNode?.marketName || null, type: market?.marketType || null });
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(payload?.events)) {
+    for (const event of payload.events) {
+      const sportName = String((event['meta-tags'] || []).find((item) => item?.type === 'SPORT')?.name || event.sportName || 'UNKNOWN').trim() || 'UNKNOWN';
+      const sportId = `sport:${sportName}`;
+      upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+      const competitionName = String((event['meta-tags'] || []).find((item) => item?.type === 'COMPETITION')?.name || event.competitionName || 'UNKNOWN').trim() || 'UNKNOWN';
+      const competitionId = `competition:${sportId}:${competitionName}`;
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+      const eventId = String(event.id || event.eventId || '').trim();
+      if (!eventId) continue;
+      upsertCatalogEntry(snapshot.events, eventId, { sportId, competitionId, name: event.name || event.eventName || null, startTime: event.start || event.startTime || null, status: event.status || null });
+      for (const market of event.markets || []) {
+        const marketId = String(market.id || market.marketId || '').trim();
+        if (!marketId) continue;
+        upsertCatalogEntry(snapshot.markets, marketId, { sportId, competitionId, eventId, name: market.name || market.marketName || null, type: market['market-type'] || market.type || null });
+      }
+    }
+  }
+
+  if (Array.isArray(payload?.leagues)) {
+    const payloadSportId = String(payload?.sportId || '').trim();
+    const sportId = payloadSportId || 'sport:UNKNOWN';
+    const sportName = normalizeSportName(payloadSportId ? `SPORT_${payloadSportId}` : 'UNKNOWN');
+    upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+
+    for (const league of payload.leagues) {
+      const competitionId = String(league?.id || '').trim() || `competition:${sportId}:${String(league?.name || 'UNKNOWN').trim()}`;
+      const competitionName = String(league?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+
+      for (const event of league?.events || []) {
+        const eventId = String(event?.id || '').trim();
+        if (!eventId) continue;
+        const participantNames = Array.isArray(event?.participants)
+          ? event.participants.map((item) => String(item?.name || item?.englishName || '').trim()).filter(Boolean)
+          : [];
+        const eventName = participantNames.length >= 2 ? `${participantNames[0]} vs ${participantNames[1]}` : null;
+        const eventStartTime = Number.isFinite(Number(event?.time)) ? new Date(Number(event.time)).toISOString() : null;
+        upsertCatalogEntry(snapshot.events, eventId, {
+          sportId,
+          competitionId,
+          name: eventName,
+          startTime: eventStartTime,
+          status: event?.live ? 'live' : 'active',
+        });
+
+        const periods = Array.isArray(event?.periods) ? event.periods : Object.values(event?.periods || {});
+        for (const period of periods) {
+          const moneyLineId = String(period?.moneyLine?.lineId || '').trim();
+          if (moneyLineId) {
+            upsertCatalogEntry(snapshot.markets, moneyLineId, { sportId, competitionId, eventId, name: 'Money Line', type: 'MATCH_ODDS' });
+          }
+
+          const handicapLines = Array.isArray(period?.handicap) ? period.handicap : Object.values(period?.handicap || {});
+          for (const line of handicapLines) {
+            const marketId = String(line?.lineId || '').trim();
+            if (!marketId) continue;
+            upsertCatalogEntry(snapshot.markets, marketId, {
+              sportId,
+              competitionId,
+              eventId,
+              name: `Handicap ${line?.homeSpread ?? ''}`.trim(),
+              type: 'ASIAN_HANDICAP',
+            });
+          }
+
+          const overUnderLines = Array.isArray(period?.overUnder) ? period.overUnder : Object.values(period?.overUnder || {});
+          for (const line of overUnderLines) {
+            const marketId = String(line?.lineId || '').trim();
+            if (!marketId) continue;
+            upsertCatalogEntry(snapshot.markets, marketId, {
+              sportId,
+              competitionId,
+              eventId,
+              name: `Over/Under ${line?.points ?? ''}`.trim(),
+              type: 'OVER_UNDER',
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const attachments = payload?.attachments;
+  if (attachments && typeof attachments === 'object') {
+    const eventTypes = attachments.eventTypes || {};
+    const competitions = attachments.competitions || {};
+    const events = attachments.events || {};
+    const markets = attachments.markets || {};
+
+    for (const [eventIdRaw, eventNode] of Object.entries(events)) {
+      const eventId = String(eventIdRaw || eventNode?.eventId || '').trim();
+      if (!eventId) continue;
+      const sportId = String(eventNode?.eventTypeId || '').trim() || `sport:${String(eventNode?.eventTypeId || 'UNKNOWN').trim()}`;
+      const sportName = normalizeSportName(String(eventTypes?.[eventNode?.eventTypeId]?.name || eventNode?.eventTypeName || 'UNKNOWN').trim() || 'UNKNOWN');
+      const competitionId = String(eventNode?.competitionId || '').trim() || `competition:${sportId}:UNKNOWN`;
+      const competitionName = String(competitions?.[competitionId]?.name || eventNode?.competitionName || 'UNKNOWN').trim() || 'UNKNOWN';
+
+      upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+      upsertCatalogEntry(snapshot.events, eventId, {
+        sportId,
+        competitionId,
+        name: eventNode?.name || eventNode?.eventName || null,
+        startTime: eventNode?.openDate || eventNode?.startTime || null,
+        status: eventNode?.inPlay ? 'live' : 'active',
+      });
+    }
+
+    for (const [marketIdRaw, marketNode] of Object.entries(markets)) {
+      const marketId = String(marketIdRaw || marketNode?.marketId || '').trim();
+      if (!marketId) continue;
+      const eventId = String(marketNode?.eventId || '').trim();
+      if (!eventId) continue;
+      const eventMeta = snapshot.events?.[eventId] || {};
+      const sportId = String(eventMeta?.sportId || marketNode?.eventTypeId || '').trim() || 'sport:UNKNOWN';
+      const competitionId = String(eventMeta?.competitionId || marketNode?.competitionId || '').trim() || `competition:${sportId}:UNKNOWN`;
+      if (!snapshot.sports?.[sportId]) {
+        const sportName = normalizeSportName(String(eventTypes?.[marketNode?.eventTypeId]?.name || 'UNKNOWN').trim() || 'UNKNOWN');
+        upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+      }
+      if (!snapshot.competitions?.[competitionId]) {
+        const competitionName = String(competitions?.[competitionId]?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+        upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+      }
+
+      upsertCatalogEntry(snapshot.markets, marketId, {
+        sportId,
+        competitionId,
+        eventId,
+        name: marketNode?.marketName || marketNode?.name || null,
+        type: marketNode?.marketType || null,
+      });
+    }
+  }
+}
+
+function relaxCatalogEndpointFilters(baseEndpoint = {}) {
+  const endpoint = {
+    ...baseEndpoint,
+    queryParameters: { ...(baseEndpoint.queryParameters || {}) },
+  };
+
+  const removable = [
+    'sportId', 'sport-ids', 'eventType', 'eventTypeId', 'eventTypeIds',
+    'market-types', 'marketTypeCodes', 'marketType', 'leagueCode', 'participant',
+    'eSportCode', 'tag-url-names', 'ids', 'en-market-names',
+  ];
+
+  let changed = false;
+  for (const key of removable) {
+    const before = endpoint.url;
+    endpoint.url = updateSearchParam(endpoint.url, key, null);
+    if (endpoint.url !== before) changed = true;
+    if (Object.prototype.hasOwnProperty.call(endpoint.queryParameters, key)) {
+      delete endpoint.queryParameters[key];
+      changed = true;
+    }
+  }
+
+  return changed ? endpoint : null;
+}
+
+function buildCatalogSnapshot(reader, catalog) {
+  if (catalog && catalog.compactSnapshot) {
+    const snapshot = catalog.compactSnapshot;
+    snapshot.endpointSummaries = catalog.endpointSummaries || snapshot.endpointSummaries || [];
+    return finalizeCatalogSnapshot(snapshot);
+  }
+  const snapshot = {
+    schema: 'fallah.current-catalog/v1',
+    houseId: reader.houseId,
+    houseName: reader.houseName,
+    sourceType: reader.houseType || 'other',
+    generatedAt: new Date().toISOString(),
+    windowFrom: new Date(catalog.window.from).toISOString(),
+    windowTo: new Date(catalog.window.to).toISOString(),
+    endpointSummaries: catalog.endpointSummaries || [],
+    sports: {},
+    competitions: {},
+    events: {},
+    markets: {},
+    activeMarketIds: [],
+    valid: false,
+  };
+
+  for (const item of catalog.payloads || []) {
+    const payload = filterPayloadByWindow(item.payload, catalog.window);
+    collectFacetCatalog(payload, snapshot);
+    collectSportsMenuCatalog(payload, snapshot);
+    collectStructuredCatalog(payload, snapshot);
+  }
+
+  return finalizeCatalogSnapshot(snapshot);
+}
+
+function finalizeCatalogSnapshot(snapshot) {
+  snapshot.activeMarketIds = [...new Set(Object.keys(snapshot.markets || {}).map((item) => String(item)).filter(Boolean))];
+  snapshot.counts = {
+    sports: Object.keys(snapshot.sports || {}).length,
+    competitions: Object.keys(snapshot.competitions || {}).length,
+    events: Object.keys(snapshot.events || {}).length,
+    markets: Object.keys(snapshot.markets || {}).length,
+  };
+  snapshot.valid = Boolean(
+    snapshot.counts.events > 0 &&
+    snapshot.counts.markets > 0 &&
+    snapshot.activeMarketIds.length > 0 &&
+    (snapshot.endpointSummaries || []).some((entry) => entry.completed)
+  );
+  return snapshot;
+}
+
+function mergeCatalogPayloadsIntoSnapshot(snapshot, payloads = []) {
+  const window = {
+    from: Date.parse(String(snapshot.windowFrom || '')),
+    to: Date.parse(String(snapshot.windowTo || '')),
+  };
+  for (const payload of payloads || []) {
+    const filteredPayload = Number.isFinite(window.from) && Number.isFinite(window.to)
+      ? filterPayloadByWindow(payload, window)
+      : payload;
+    collectFacetCatalog(filteredPayload, snapshot);
+    collectSportsMenuCatalog(filteredPayload, snapshot);
+    collectStructuredCatalog(filteredPayload, snapshot);
+  }
+
+  return finalizeCatalogSnapshot(snapshot);
+}
+
+function buildCatalogCurrentStateRecords(snapshot = {}) {
+  const records = [];
+  for (const market of Object.values(snapshot.markets || {})) {
+    const eventId = String(market?.eventId || '').trim();
+    const marketId = String(market?.id || '').trim();
+    if (!eventId || !marketId) continue;
+    const event = snapshot.events?.[eventId] || {};
+    const competition = snapshot.competitions?.[market.competitionId] || {};
+    const sport = snapshot.sports?.[market.sportId] || {};
+    records.push({
+      schema: 'fallah.normalized/v2',
+      id: stableRecordId([snapshot.houseId, eventId, marketId, 'catalog']),
+      houseId: snapshot.houseId,
+      readerId: null,
+      sourceProvider: snapshot.houseName || null,
+      sourceEndpoint: 'catalog-snapshot',
+      sport: sport.name || 'UNKNOWN',
+      sportId: market.sportId || null,
+      competition: competition.name || 'UNKNOWN',
+      competitionId: market.competitionId || null,
+      event: {
+        id: eventId,
+        name: event.name || 'UNKNOWN',
+        startTime: event.startTime || null,
+        sourceTimezone: null,
+      },
+      market: {
+        id: marketId,
+        name: market.name || 'IDENTIFIED_MARKET',
+        type: market.type || 'IDENTIFIED_MARKET',
+        status: event.status || null,
+        startTime: event.startTime || null,
+      },
+      runner: {
+        id: '',
+        name: '',
+        selectionId: '',
+        handicap: null,
+        status: null,
+      },
+      prices: {
+        back: null,
+        lay: null,
+        odd: null,
+        liquidity: null,
+        volume: null,
+        bestBack: { price: null, size: null },
+        bestLay: { price: null, size: null },
+        availableToBack: [],
+        availableToLay: [],
+      },
+      timestamps: {
+        sourceTimestamp: snapshot.generatedAt || null,
+        collectedAt: snapshot.generatedAt || new Date().toISOString(),
+        updatedAt: snapshot.generatedAt || new Date().toISOString(),
+      },
+      timestamp: snapshot.generatedAt || new Date().toISOString(),
+      status: event.status || 'active',
+      inPlay: false,
+      collectedAt: snapshot.generatedAt || new Date().toISOString(),
+      updatedAt: snapshot.generatedAt || new Date().toISOString(),
+      normalizedAt: snapshot.generatedAt || new Date().toISOString(),
+    });
+  }
+  return records;
+}
+
+function buildCatalogLookup(snapshot = {}) {
+  const sports = snapshot.sports || {};
+  const competitions = snapshot.competitions || {};
+  const events = snapshot.events || {};
+  const markets = snapshot.markets || {};
+  const marketToEvent = Object.fromEntries(
+    Object.entries(markets)
+      .map(([marketId, market]) => [String(marketId || ''), String(market?.eventId || '')])
+      .filter(([marketId, eventId]) => Boolean(marketId) && Boolean(eventId))
+  );
+
+  return { sports, competitions, events, markets, marketToEvent };
+}
+
+function unknownLike(value) {
+  const text = String(value || '').trim();
+  return !text || text.toUpperCase() === 'UNKNOWN' || /^SPORT_\d+$/i.test(text);
+}
+
+function enrichCurrentStateRecordFromCatalog(record = {}, catalogLookup = {}) {
+  const marketId = String(record?.market?.id || '').trim();
+  const directEventId = String(record?.event?.id || '').trim();
+  const eventId = directEventId || String(catalogLookup.marketToEvent?.[marketId] || '').trim();
+  const eventMeta = eventId ? catalogLookup.events?.[eventId] : null;
+  const marketMeta = marketId ? catalogLookup.markets?.[marketId] : null;
+  const competitionId = String(eventMeta?.competitionId || marketMeta?.competitionId || '').trim();
+  const competitionMeta = competitionId ? catalogLookup.competitions?.[competitionId] : null;
+  const sportId = String(eventMeta?.sportId || marketMeta?.sportId || competitionMeta?.sportId || '').trim();
+  const sportMeta = sportId ? catalogLookup.sports?.[sportId] : null;
+
+  return {
+    ...record,
+    sport: normalizeSportName(unknownLike(record?.sport) ? (sportMeta?.name || record?.sport || 'UNKNOWN') : record.sport),
+    competition: unknownLike(record?.competition) ? (competitionMeta?.name || record?.competition || 'UNKNOWN') : record.competition,
+    event: {
+      ...(record.event || {}),
+      id: eventId || record?.event?.id || null,
+      name: unknownLike(record?.event?.name) ? (eventMeta?.name || record?.event?.name || 'UNKNOWN') : record.event.name,
+      startTime: record?.event?.startTime || eventMeta?.startTime || null,
+    },
+    market: {
+      ...(record.market || {}),
+      id: marketId || record?.market?.id || null,
+      name: unknownLike(record?.market?.name) ? (marketMeta?.name || record?.market?.name || 'IDENTIFIED_MARKET') : record.market.name,
+      type: unknownLike(record?.market?.type) ? (marketMeta?.type || record?.market?.type || 'IDENTIFIED_MARKET') : record.market.type,
+      startTime: record?.market?.startTime || eventMeta?.startTime || null,
+    },
+  };
+}
+
+function executionPriority(reader = {}, endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  let score = Number(endpoint.utilityScore || 0);
+  const types = (() => {
+    try {
+      return String(new URL(endpoint.url).searchParams.get('types') || '').toUpperCase();
+    } catch {
+      return '';
+    }
+  })();
+  if (String(reader.houseType || '').toLowerCase() === 'exchange') {
+    if (/\/exchange\//.test(url)) score += 40;
+    if (/fixedodds/.test(url)) score -= 80;
+    if (/\/bymarket/.test(url)) score += 80;
+    if (/RUNNER_EXCHANGE_PRICES_BEST|MARKET_RATES|RUNNER_DESCRIPTION|RUNNER_STATE|EVENT/.test(types)) score += 120;
+    if (types === 'MARKET_STATE') score -= 20;
+    if (/inplayservice/.test(url)) score -= 10;
+  }
+  return score;
+}
+
+function isRichExchangeMarketEndpoint(endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  if (!/\/bymarket/.test(url)) return false;
+  try {
+    const types = String(new URL(endpoint.url).searchParams.get('types') || '').toUpperCase();
+    return /RUNNER_EXCHANGE_PRICES_BEST|MARKET_RATES|RUNNER_DESCRIPTION|RUNNER_STATE|EVENT/.test(types);
+  } catch {
+    return false;
+  }
+}
+
+
+function patch134AppendMaster(category, payload = {}) {
+  appendMaster(category, payload);
+}
+
+function patch134SnapshotSummary(payload, reader, window) {
+  const snapshot = {
+    schema: 'fallah.patch134-origin-audit/v1',
+    houseId: reader?.houseId,
+    houseName: reader?.houseName,
+    sourceType: reader?.houseType || 'other',
+    generatedAt: new Date().toISOString(),
+    windowFrom: new Date(window.from).toISOString(),
+    windowTo: new Date(window.to).toISOString(),
+    endpointSummaries: [],
+    sports: {},
+    competitions: {},
+    events: {},
+    markets: {},
+    activeMarketIds: [],
+    valid: false,
+  };
+  try {
+    collectFacetCatalog(payload, snapshot);
+    collectSportsMenuCatalog(payload, snapshot);
+    collectStructuredCatalog(payload, snapshot);
+  } catch {
+    // A auditoria deve continuar mesmo quando um formato não for reconhecido.
+  }
+
+  const sportNameById = new Map(
+    Object.entries(snapshot.sports || {}).map(([id, sport]) => [
+      String(id),
+      String(sport?.name || sport?.sportName || id || 'UNKNOWN'),
+    ])
+  );
+
+  const bySport = {};
+  const ensureSport = (name) => {
+    const key = String(name || 'UNKNOWN').trim() || 'UNKNOWN';
+    if (!bySport[key]) bySport[key] = {
+      events: 0, markets: 0, today: 0, tomorrow: 0, outsideWindow: 0,
+      noStartTime: 0, samples: [],
+    };
+    return bySport[key];
+  };
+
+  const eventSport = new Map();
+  for (const [eventId, event] of Object.entries(snapshot.events || {})) {
+    const sportName =
+      event?.sportName ||
+      sportNameById.get(String(event?.sportId || '')) ||
+      event?.sport ||
+      'UNKNOWN';
+    const row = ensureSport(sportName);
+    row.events += 1;
+    eventSport.set(String(eventId), String(sportName));
+
+    const ts =
+      parseIso(event?.start) ??
+      parseIso(event?.startTime) ??
+      parseIso(event?.openDate) ??
+      parseIso(event?.timestamp);
+
+    let bucket = 'noStartTime';
+    if (ts !== null) {
+      const midpoint = window.from + (24 * 60 * 60 * 1000);
+      if (ts >= window.from && ts < midpoint) bucket = 'today';
+      else if (ts >= midpoint && ts <= window.to) bucket = 'tomorrow';
+      else bucket = 'outsideWindow';
+    }
+    row[bucket] += 1;
+
+    if (row.samples.length < 15) {
+      row.samples.push({
+        eventId: String(event?.id || eventId),
+        name: String(event?.name || event?.eventName || 'UNKNOWN'),
+        startTime: event?.startTime || event?.start || event?.openDate || event?.timestamp || null,
+        bucket,
+      });
+    }
+  }
+
+  for (const [marketId, market] of Object.entries(snapshot.markets || {})) {
+    const eventId = String(market?.eventId || market?.event?.id || '');
+    const sportName =
+      market?.sportName ||
+      sportNameById.get(String(market?.sportId || '')) ||
+      eventSport.get(eventId) ||
+      'UNKNOWN';
+    ensureSport(sportName).markets += 1;
+  }
+
+  return {
+    sportsCount: Object.keys(snapshot.sports || {}).length,
+    eventsCount: Object.keys(snapshot.events || {}).length,
+    marketsCount: Object.keys(snapshot.markets || {}).length,
+    activeMarketIdsCount: (snapshot.activeMarketIds || []).length,
+    bySport,
+    topLevelKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 40) : [],
+  };
+}
+
+function filterPayloadByWindow(payload, window) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (Array.isArray(payload?.events)) {
+    const filtered = payload.events.filter((event) => {
+      const ts =
+        parseIso(event?.start) ??
+        parseIso(event?.startTime) ??
+        parseIso(event?.openDate) ??
+        parseIso(event?.timestamp);
+      if (ts === null) return true;
+      return ts >= window.from && ts <= window.to;
+    });
+    return { ...payload, events: filtered };
+  }
+  if (Array.isArray(payload?.eventTypes)) {
+    const eventTypes = payload.eventTypes
+      .map((eventType) => {
+        const eventNodes = (eventType?.eventNodes || []).filter((eventNode) => {
+          const event = eventNode?.event || {};
+          const ts = parseIso(event.openDate) ?? parseIso(event.startTime) ?? parseIso(eventNode?.startTime);
+          if (ts === null) return true;
+          return ts >= window.from && ts <= window.to;
+        });
+        return { ...eventType, eventNodes };
+      })
+      .filter((eventType) => (eventType.eventNodes || []).length > 0);
+    return { ...payload, eventTypes };
+  }
+  if (Array.isArray(payload?.leagues)) {
+    const leagues = payload.leagues
+      .map((league) => {
+        const events = (league?.events || []).filter((event) => {
+          const ts = Number.isFinite(Number(event?.time)) ? Number(event.time) : null;
+          if (ts === null) return true;
+          return ts >= window.from && ts <= window.to;
+        });
+        return { ...league, events };
+      })
+      .filter((league) => (league.events || []).length > 0);
+    return { ...payload, leagues };
+  }
+  return payload;
+}
+
+function hasRemainingByPagination(pageData = {}) {
+  if (Number.isFinite(pageData.total) && Number.isFinite(pageData.offset) && Number.isFinite(pageData.limit)) {
+    return pageData.offset + pageData.limit < pageData.total;
+  }
+  if (Number.isFinite(pageData.itemsCount) && Number.isFinite(pageData.limit)) {
+    return pageData.itemsCount >= pageData.limit;
+  }
+  return false;
+}
+
+function extractPaginationMeta(payload, endpointUrl) {
+  const total = toFiniteNumber(payload?.total);
+  const offset = toFiniteNumber(payload?.offset ?? getSearchParam(endpointUrl, 'offset'));
+  const limit = toFiniteNumber(
+    payload?.perPage ??
+      payload?.per_page ??
+      payload?.limit ??
+      getSearchParam(endpointUrl, 'per-page') ??
+      getSearchParam(endpointUrl, 'per_page') ??
+      getSearchParam(endpointUrl, 'limit')
+  );
+  const eventsCount = Array.isArray(payload?.events) ? payload.events.length : null;
+  return {
+    total,
+    offset,
+    limit,
+    itemsCount: Number.isFinite(eventsCount) ? eventsCount : null,
+    hasNextCursor: Boolean(payload?.next || payload?.nextCursor || payload?.cursor?.next),
+    nextCursor: payload?.next || payload?.nextCursor || payload?.cursor?.next || null,
+  };
+}
+
+function extractEndpointMarketIds(endpoint = {}) {
+  const fromUrl = String(getSearchParam(endpoint.url, 'marketIds') || '')
+    .split(',')
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+  const fromField = Array.isArray(endpoint.marketIds)
+    ? endpoint.marketIds.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  return dedupeBy([...fromUrl, ...fromField], (item) => item);
+}
+
+function uniqueMarketIdsFromRecords(records = []) {
+  return dedupeBy(
+    (records || [])
+      .map((record) => String(record?.market?.id || '').trim())
+      .filter(Boolean),
+    (id) => id,
+  );
+}
+
+function uniqueEventIdsFromRecords(records = []) {
+  return dedupeBy(
+    (records || [])
+      .map((record) => String(record?.event?.id || '').trim())
+      .filter(Boolean),
+    (id) => id,
+  );
+}
+
+function resolveBody(endpoint, method) {
+  if (['GET', 'HEAD'].includes(method)) return undefined;
+  if (endpoint.body === null || endpoint.body === undefined) return undefined;
+  if (typeof endpoint.body === 'string') return endpoint.body;
+  return JSON.stringify(endpoint.body);
+}
+
+function hasOperationalPrices(record = {}) {
+  const back = Number(record?.prices?.back);
+  const lay = Number(record?.prices?.lay);
+  return (Number.isFinite(back) && back > 0) || (Number.isFinite(lay) && lay > 0);
+}
+
+function hasRealRunnerIdentity(record = {}) {
+  const name = String(record?.runner?.name || '').trim().toUpperCase();
+  return Boolean(name) && name !== 'UNKNOWN';
+}
+
+function recordCompletenessScore(record = {}) {
+  let score = 0;
+  if (record?.event?.id) score += 1;
+  if (record?.market?.id) score += 1;
+  if (record?.runner?.id) score += 1;
+  if (hasRealRunnerIdentity(record)) score += 2;
+  if (hasOperationalPrices(record)) score += 3;
+  return score;
+}
+
+function recordIdentityKey(record = {}) {
+  const runnerIdentity = String(
+    record.runner?.id ||
+    record.runner?.selectionId ||
+    record.runner?.name ||
+    ''
+  ).trim().toUpperCase();
+  return [
+    String(record.houseId || ''),
+    String(record.event?.id || ''),
+    String(record.market?.id || ''),
+    runnerIdentity,
+  ].join('|');
+}
+
+function classifyRecordCapability(record = {}) {
+  const hasCoreIdentity = Boolean(record?.event?.id && record?.market?.id);
+  if (!hasCoreIdentity) return 'UNKNOWN_CAPABILITY';
+  if (hasRealRunnerIdentity(record) && hasOperationalPrices(record)) return 'MARKET_DATA_CAPABILITY';
+  return 'CATALOG_CAPABILITY';
+}
+
+function selectMoreCompleteRecord(current, incoming) {
+  if (!current) return incoming;
+  const currentScore = recordCompletenessScore(current);
+  const incomingScore = recordCompletenessScore(incoming);
+  if (incomingScore > currentScore) return incoming;
+  if (incomingScore < currentScore) return current;
+
+  const currentTs = Date.parse(current?.lastUpdatedAt || current?.normalizedAt || current?.timestamp || '');
+  const incomingTs = Date.parse(incoming?.lastUpdatedAt || incoming?.normalizedAt || incoming?.timestamp || '');
+  if (Number.isFinite(incomingTs) && Number.isFinite(currentTs) && incomingTs > currentTs) return incoming;
+  if (Number.isFinite(incomingTs) && !Number.isFinite(currentTs)) return incoming;
+  return current;
+}
+
+function mergeCurrentStateRecords(records = []) {
+  const byIdentity = new Map();
+  for (const record of records || []) {
+    const key = recordIdentityKey(record);
+    if (!key || key === '|||') continue;
+    const existing = byIdentity.get(key);
+    byIdentity.set(key, selectMoreCompleteRecord(existing, record));
+  }
+
+  return [...byIdentity.values()];
+}
+
+class ArbitrageDataPipelineService {
+  constructor(options = {}) {
+    this.generator = new ReaderGeneratorService(options);
+    this.engine = new EngineDataService(options);
+    this.coverageMonitor = new CoverageMonitorService(options);
+    this.runners = new Map();
+    this.states = new Map();
+    this.initialized = false;
+    this.cpuSample = { usage: process.cpuUsage(), at: process.hrtime.bigint() };
+    this.operationalMode = 'OFFLINE';
+    this.pausedReaderIds = new Set();
+    // PATCH 118: last complete per-house normalized state. A partial reader cycle must
+    // never erase a previously valid house snapshot used by cross-house matching.
+    this.lastGoodHouseRecords = new Map();
+  }
+
+  async refreshCoverageMonitor(context = {}) {
+    try {
+      const result = await this.coverageMonitor.updateCurrentState();
+      if (!result.updated) {
+        await this.engine.log('errors', 'coverage-monitor.update.failed', {
+          readerId: context.readerId || null,
+          houseId: context.houseId || null,
+          reason: result.error || 'UNKNOWN',
+          preserved: Boolean(result.preserved),
+        });
+      }
+      return result;
+    } catch (error) {
+      await this.engine.log('errors', 'coverage-monitor.update.exception', {
+        readerId: context.readerId || null,
+        houseId: context.houseId || null,
+        reason: error.message,
+      });
+      return { updated: false, error: error.message, preserved: true };
+    }
+  }
+
+  async initialize({ start = true, ensureProfiles = true } = {}) {
+    if (!this.initialized) {
+      await this.engine.initialize();
+      this.initialized = true;
+    }
+    if (ensureProfiles) await this.ensureHouseProfiles();
+    const discovery = require('./discoveryEngineService').discoveryEngineService;
+    const configuredHouses = await discovery.listHouses().catch(() => []);
+    this.allowedHouseIds = new Set((configuredHouses || []).map((house) => String(house.id || '')).filter(Boolean));
+    const generatedReaders = await this.generator.generateAll();
+    const readers = generatedReaders.filter((reader) => this.allowedHouseIds.has(String(reader.houseId || '')));
+    for (const [readerId, runner] of [...this.runners.entries()]) {
+      const state = this.states.get(readerId);
+      if (!this.allowedHouseIds.has(String(state?.houseId || ''))) {
+        writeConnectionDiagnostic({ event: 'ORPHAN_READER_PURGED', readerId, houseId: state?.houseId || null });
+        this.stopReader(readerId);
+        this.states.delete(readerId);
+      }
+    }
+    writeConnectionDiagnostic({ event: 'AUTHORITATIVE_HOUSES_APPLIED', configured: configuredHouses.length, generated: generatedReaders.length, accepted: readers.length, houseIds: [...this.allowedHouseIds] });
+    if (start) {
+      for (const reader of readers) if (reader.active) this.startReader(reader);
+    }
+    return this.status();
+  }
+
+  async ensureHouseProfiles() {
+    let discovery = null;
+    try {
+      ({ discoveryEngineService: discovery } = require('./discoveryEngineService'));
+    } catch {
+      return;
+    }
+    if (!discovery || typeof discovery.listHouses !== 'function') return;
+
+    const houses = await discovery.listHouses().catch(() => []);
+    if (!Array.isArray(houses) || !houses.length) return;
+
+    // PATCH 76: discovery/profile repair is deliberately serialized. Hidden Chromium
+    // renderers are memory-heavy; launching several at once was the main source of
+    // RSS spikes and renderer/app instability while connecting many houses.
+    for (const house of houses.filter((item) => item?.active && !item?.blocked)) {
+      try {
+        await this.ensureHouseProfile(discovery, house);
+      } catch (error) {
+        writeHealthLog({ house: house.name, houseId: house.id, event: 'PROFILE_ENSURE_FAIL', error: String(error?.message || error).slice(0, 240) });
+      }
+    }
+  }
+
+  async ensureHouseProfile(discovery, house) {
+    const profileFile = String(house?.profileFile || '').trim();
+    const profileRoot = this.generator.profilesRoot;
+    const profilePath = profileFile ? path.resolve(profileRoot, profileFile) : null;
+
+    let profileValid = false;
+    if (profilePath) {
+      try {
+        if (profilePath.startsWith(`${profileRoot}${path.sep}`) && (await fs.pathExists(profilePath))) {
+          const profile = await fs.readJson(profilePath);
+          profileValid = ['fallah.discovery.profile/v1', 'fallah.discovery.profile/v2'].includes(profile?.profileSchema)
+            && Array.isArray(profile?.network?.endpoints)
+            && profile.network.endpoints.length > 0;
+        }
+      } catch {
+        profileValid = false;
+      }
+    }
+
+    if (profileValid) return;
+
+    await this.engine.log('readers', 'reader.profile.missing-or-invalid', {
+      houseId: house.id,
+      houseName: house.name,
+      profileFile: profileFile || null,
+    });
+
+    if (typeof discovery.runDiscovery !== 'function') return;
+    try {
+      let task = discovery.running?.get?.(house.id);
+      if (!task) {
+        await discovery.runDiscovery(house.id, { observationMs: 10000 });
+        task = discovery.running?.get?.(house.id) || null;
+      }
+      if (task && typeof task.then === 'function') {
+        await Promise.race([
+          task,
+          new Promise((resolve) => setTimeout(resolve, 120000)),
+        ]);
+      }
+    } catch (error) {
+      await this.engine.log('errors', 'reader.profile.discovery.failed', {
+        houseId: house.id,
+        houseName: house.name,
+        reason: error.message,
+      });
+    }
+  }
+
+  async regenerate() {
+    await this.engine.log('readers', 'reader-generator.started');
+    const discovery = require('./discoveryEngineService').discoveryEngineService;
+    const configuredHouses = await discovery.listHouses().catch(() => []);
+    this.allowedHouseIds = new Set((configuredHouses || []).map((house) => String(house.id || '')).filter(Boolean));
+    const generatedReaders = await this.generator.generateAll();
+    const readers = generatedReaders.filter((reader) => this.allowedHouseIds.has(String(reader.houseId || '')));
+    for (const [readerId] of [...this.runners.entries()]) {
+      const state = this.states.get(readerId);
+      if (!this.allowedHouseIds.has(String(state?.houseId || ''))) {
+        writeConnectionDiagnostic({ event: 'ORPHAN_READER_PURGED', readerId, houseId: state?.houseId || null });
+        this.stopReader(readerId);
+        this.states.delete(readerId);
+      }
+    }
+    for (const reader of readers) {
+      const runner = this.runners.get(reader.id);
+      if (runner && runner.sourceFingerprint !== reader.sourceFingerprint) this.stopReader(reader.id);
+      if (reader.active) this.startReader(reader);
+      else this.stopReader(reader.id);
+    }
+    await this.engine.log('readers', 'reader-generator.completed', { readers: readers.length });
+    return readers;
+  }
+
+  startReader(reader) {
+    if (this.allowedHouseIds instanceof Set && !this.allowedHouseIds.has(String(reader?.houseId || ''))) {
+      writeConnectionDiagnostic({ event: 'UNREGISTERED_READER_BLOCKED', house: reader?.houseName || null, houseId: reader?.houseId || null, readerId: reader?.id || null });
+      return;
+    }
+    if (this.runners.has(reader.id) || reader.blocked) return;
+    // PATCH 95: one live runner per house. A duplicated generated profile must not
+    // consume a second scheduler slot or make bootstrap report 16 readers for 15 houses.
+    const duplicateHouseRunner = [...this.runners.entries()].find(([existingId, existingRunner]) => {
+      if (existingId === reader.id || existingRunner?.stopped) return false;
+      const existingState = this.states.get(existingId);
+      return String(existingState?.houseId || '') === String(reader.houseId || '');
+    });
+    if (duplicateHouseRunner) {
+      writeConnectionDiagnostic({ event: 'DUPLICATE_HOUSE_READER_SUPPRESSED', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, existingReaderId: duplicateHouseRunner[0] });
+      return;
+    }
+    const runner = {
+      stopped: false,
+      timer: null,
+      cycleRunning: false,
+      consecutiveFailures: 0,
+      consecutiveEmptyCycles: 0,
+      sourceFingerprint: reader.sourceFingerprint,
+      nextScheduledAt: Date.now(),
+    };
+    this.runners.set(reader.id, runner);
+    writeConnectionDiagnostic({ event: 'READER_STARTED', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, intervalMs: Number(reader.intervalMs || 0), timeoutMs: Number(reader.timeoutMs || 0) });
+    this.states.set(reader.id, {
+      readerId: reader.id,
+      houseId: reader.houseId,
+      status: 'starting',
+      retries: 0,
+      reconnects: 0,
+      errors: 0,
+      cycles: 0,
+      records: 0,
+      odds: 0,
+      events: 0,
+      markets: 0,
+      activeEndpoints: [],
+      averageLatencyMs: 0,
+      averageCycleMs: 0,
+      lastLatencyMs: 0,
+      lastCycleMs: 0,
+      collectionRunning: false,
+      lastQueueWaitMs: 0,
+      lastBackoffMs: 0,
+      heartbeatPulseCount: 0,
+      heartbeatAt: new Date().toISOString(),
+      heartbeatHealthy: true,
+      lastRunAt: null,
+      lastSuccessAt: null,
+      lastCaptureAt: null,
+      lastFreshAt: null,
+      freshOdds: 0,
+      firstSuccessfulRequestAt: null,
+      firstAcceptedRecordAt: null,
+      firstFreshAt: null,
+      freshCycles: 0,
+      averageFreshIntervalMs: 0,
+      lastError: null,
+      structuralChanges: 0,
+      endpointChanges: reader.changeDetection?.endpoint ? 1 : 0,
+      apiChanges: reader.changeDetection?.api ? 1 : 0,
+      layoutChanges: reader.changeDetection?.layout ? 1 : 0,
+      alerts: [],
+      lastCatalog: null,
+    });
+
+    if (LOOP_TRACE_ENABLED) {
+      this.engine.log('readers', 'READER_LOOP_STARTED', {
+        readerId: reader.id,
+        houseId: reader.houseId,
+        houseName: reader.houseName,
+        intervalMs: Number(reader.intervalMs || 0),
+        timeoutMs: Number(reader.timeoutMs || 0),
+      }).catch(() => null);
+    }
+
+    const cycle = async () => {
+      if (runner.stopped) return;
+      // Cycle lock: skip if previous cycle still running to prevent overlapping fetches
+      if (runner.cycleRunning) {
+        const s = this.states.get(reader.id);
+        if (s) s.cyclesSkipped = (s.cyclesSkipped || 0) + 1;
+        if (LOOP_TRACE_ENABLED) {
+          this.engine.log('readers', 'READER_RUN_SKIPPED_BUSY', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            cyclesSkipped: Number(s?.cyclesSkipped || 0),
+            cycleRunning: true,
+          }).catch(() => null);
+        }
+        if (!runner.stopped) {
+          const expectedAt = new Date(Date.now() + Number(reader.intervalMs || 0)).toISOString();
+          if (LOOP_TRACE_ENABLED) {
+            this.engine.log('readers', 'NEXT_RUN_SCHEDULED', {
+              readerId: reader.id,
+              houseId: reader.houseId,
+              delayMs: Number(reader.intervalMs || 0),
+              expectedAt,
+              reason: 'BUSY_SKIP',
+            }).catch(() => null);
+          }
+          runner.nextScheduledAt = Date.parse(expectedAt);
+          runner.timer = setTimeout(cycle, reader.intervalMs);
+          runner.timer.unref?.();
+        }
+        return;
+      }
+
+      if (LOOP_TRACE_ENABLED) {
+        this.engine.log('readers', 'NEXT_RUN_STARTED', {
+          readerId: reader.id,
+          houseId: reader.houseId,
+          startedAt: new Date().toISOString(),
+        }).catch(() => null);
+      }
+
+      runner.cycleRunning = true;
+      const cycleState = this.states.get(reader.id);
+      const queueWaitMs = Math.max(0, Date.now() - Number(runner.nextScheduledAt || Date.now()));
+      if (cycleState) {
+        cycleState.collectionRunning = true;
+        cycleState.lastQueueWaitMs = queueWaitMs;
+      }
+      try {
+        if (LOOP_TRACE_ENABLED) {
+          this.engine.log('readers', 'READER_RUN_STARTED', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            startedAt: new Date().toISOString(),
+            queueWaitMs: Number(queueWaitMs || 0),
+          }).catch(() => null);
+        }
+        const releaseHeavySlot = await liveCycleScheduler.acquire({ house: reader.houseName, houseId: reader.houseId, readerId: reader.id, retryAttempt: Number(runner.consecutiveFailures || 0) + Number(runner.consecutiveEmptyCycles || 0) });
+        let cycleError = null;
+        try {
+          if (runner.stopped) return;
+          await this.runReader(reader, { queueWaitMs });
+        } catch (error) {
+          cycleError = error;
+          throw error;
+        } finally {
+          const postRunState = this.states.get(reader.id);
+          const producedForScheduler = Number(postRunState?.records || 0) > 0 ||
+            Number(postRunState?.odds || 0) > 0 ||
+            Number(postRunState?.events || 0) > 0 ||
+            Number(postRunState?.markets || 0) > 0;
+          releaseHeavySlot(cycleError ? 'ERROR' : (producedForScheduler ? 'OK' : 'EMPTY'), cycleError);
+        }
+        runner.consecutiveFailures = 0;
+        const s = this.states.get(reader.id);
+        const producedSportsData = Number(s?.records || 0) > 0 || Number(s?.odds || 0) > 0 || Number(s?.events || 0) > 0 || Number(s?.markets || 0) > 0;
+        runner.consecutiveEmptyCycles = producedSportsData ? 0 : Number(runner.consecutiveEmptyCycles || 0) + 1;
+        if (!producedSportsData && s && s.cycles <= 3) {
+          s.status = 'reconnecting';
+          writeConnectionDiagnostic({
+            event: 'EMPTY_BOOTSTRAP_FAST_RETRY',
+            house: reader.houseName, houseId: reader.houseId, readerId: reader.id,
+            emptyCycle: runner.consecutiveEmptyCycles,
+          });
+        }
+        if (s && s.status === 'circuit_open') s.status = 'connected';
+        // Seguro Bet was technically completing requests while returning zero sports data.
+        // Treat repeated empty cycles as degraded and refresh only its Discovery profile.
+        const okHouseName = String(reader.houseName || '').trim().toUpperCase();
+        if (okHouseName === 'SEGURO BET' && runner.consecutiveEmptyCycles >= 2 && runner.consecutiveEmptyCycles % 2 === 0) {
+          try {
+            const { discoveryEngineService } = require('./discoveryEngineService');
+            const house = (await discoveryEngineService.listHouses()).find((item) => String(item.id) === String(reader.houseId));
+            if (house) {
+              writeConnectionDiagnostic({ event: 'EMPTY_DATA_PROFILE_REFRESH_START', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, consecutiveEmptyCycles: runner.consecutiveEmptyCycles });
+              await this.ensureHouseProfile(discoveryEngineService, house);
+              const regenerated = await this.generator.generateAll();
+              const refreshed = regenerated.find((item) => String(item.houseId) === String(reader.houseId) && item.active !== false && !item.blocked);
+              if (refreshed) {
+                Object.assign(reader, refreshed);
+                writeConnectionDiagnostic({ event: 'EMPTY_DATA_PROFILE_REFRESH_OK', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, endpointCount: Array.isArray(reader.endpoints) ? reader.endpoints.length : 0, houseType: reader.houseType || null });
+              } else {
+                writeConnectionDiagnostic({ event: 'EMPTY_DATA_PROFILE_REFRESH_NO_READER', house: reader.houseName, houseId: reader.houseId, readerId: reader.id });
+              }
+            }
+          } catch (refreshError) {
+            writeConnectionDiagnostic({ event: 'EMPTY_DATA_PROFILE_REFRESH_FAIL', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, error: String(refreshError?.message || refreshError || 'UNKNOWN').slice(0, 500) });
+          }
+        }
+        writeHealthLog({ house: reader.houseName, readerId: reader.id, event: producedSportsData ? 'CYCLE_OK' : 'CYCLE_EMPTY', status: s?.status, consecutiveFailures: 0, consecutiveEmptyCycles: runner.consecutiveEmptyCycles, heapUsedMB: Math.round(process.memoryUsage().heapUsed/1048576), rssMB: Math.round(process.memoryUsage().rss/1048576) });
+        writeConnectionDiagnostic({ house: reader.houseName, houseId: reader.houseId, readerId: reader.id, event: 'HOUSE_CYCLE_OK', status: s?.status, consecutiveFailures: 0, lastSuccessAt: s?.lastSuccessAt || null, records: Number(s?.records || 0), odds: Number(s?.odds || 0), events: Number(s?.events || 0), markets: Number(s?.markets || 0) });
+        if (LOOP_TRACE_ENABLED) {
+          this.engine.log('readers', 'READER_RUN_COMPLETED', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            completedAt: new Date().toISOString(),
+            consecutiveFailures: 0,
+          }).catch(() => null);
+        }
+      } catch (err) {
+        runner.consecutiveFailures += 1;
+        const s = this.states.get(reader.id);
+        const newStatus = runner.consecutiveFailures >= 10 ? 'circuit_open' : 'reconnecting';
+        if (s) s.status = newStatus;
+        writeConnectionDiagnostic({ house: reader.houseName, houseId: reader.houseId, readerId: reader.id, event: 'HOUSE_CYCLE_FAIL', status: newStatus, consecutiveFailures: runner.consecutiveFailures, error: String(err?.message || 'UNKNOWN').slice(0, 500) });
+
+        // PATCH 94: BET365/NOVIBET profiles can age into auxiliary-only endpoints or an
+        // incorrect exchange classification. Refresh only these failed profiles, then
+        // hot-reload the generated reader in-place so the next retry uses newly observed
+        // sportsbook endpoints without restarting or disturbing the 13 healthy houses.
+        const failedHouseName = String(reader.houseName || '').trim().toUpperCase();
+        if ((failedHouseName === 'BET365' || failedHouseName === 'NOVIBET') && runner.consecutiveFailures >= 2 && runner.consecutiveFailures % 2 === 0) {
+          try {
+            const { discoveryEngineService } = require('./discoveryEngineService');
+            const house = (await discoveryEngineService.listHouses()).find((item) => String(item.id) === String(reader.houseId));
+            if (house) {
+              writeConnectionDiagnostic({ event: 'TARGETED_PROFILE_REFRESH_START', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, consecutiveFailures: runner.consecutiveFailures });
+              await this.ensureHouseProfile(discoveryEngineService, house);
+              const regenerated = await this.generator.generateAll();
+              const refreshed = regenerated.find((item) => String(item.houseId) === String(reader.houseId) && item.active !== false);
+              if (refreshed) {
+                Object.assign(reader, refreshed);
+                writeConnectionDiagnostic({ event: 'TARGETED_PROFILE_REFRESH_OK', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, endpointCount: Array.isArray(reader.endpoints) ? reader.endpoints.length : 0, houseType: reader.houseType || null });
+              } else {
+                writeConnectionDiagnostic({ event: 'TARGETED_PROFILE_REFRESH_NO_READER', house: reader.houseName, houseId: reader.houseId, readerId: reader.id });
+              }
+            }
+          } catch (refreshError) {
+            writeConnectionDiagnostic({ event: 'TARGETED_PROFILE_REFRESH_FAIL', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, error: String(refreshError?.message || refreshError || 'UNKNOWN').slice(0, 500) });
+          }
+        }
+
+        writeHealthLog({
+          house: reader.houseName, readerId: reader.id, event: 'CYCLE_FAIL',
+          UI_OFFLINE_TRIGGER: newStatus === 'circuit_open' ? 'CIRCUIT_OPEN' : 'STATUS_ERROR',
+          status: newStatus, consecutiveFailures: runner.consecutiveFailures,
+          error: err?.message?.slice(0, 200),
+          heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1048576),
+        });
+        if (LOOP_TRACE_ENABLED) {
+          this.engine.log('readers', 'LOOP_ERROR', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            status: newStatus,
+            error: String(err?.message || 'UNKNOWN').slice(0, 240),
+          }).catch(() => null);
+        }
+      } finally {
+        runner.cycleRunning = false;
+        const stateAfter = this.states.get(reader.id);
+        if (stateAfter) stateAfter.collectionRunning = false;
+      }
+      if (!runner.stopped) {
+        // Exponential backoff capped at 60 s for persistent failures; normal interval otherwise
+        const bootstrapRetryCount = Number(runner.consecutiveFailures || 0) + Number(runner.consecutiveEmptyCycles || 0);
+        const needsFastBootstrapRetry = bootstrapRetryCount > 0 && !liveCycleScheduler.bootstrapCompleted.has(String(reader.id || reader.houseId || reader.houseName));
+        const fastRetryMs = [10000, 20000, 30000][Math.min(bootstrapRetryCount - 1, 2)];
+        const backoffMs = needsFastBootstrapRetry
+          ? fastRetryMs
+          : (runner.consecutiveFailures > 0
+              ? Math.min(reader.intervalMs * (1 << Math.min(runner.consecutiveFailures - 1, 4)), 60000)
+              : reader.intervalMs);
+        const stateForSchedule = this.states.get(reader.id);
+        if (stateForSchedule) stateForSchedule.lastBackoffMs = backoffMs;
+        if (runner.consecutiveFailures > 0) writeConnectionDiagnostic({ house: reader.houseName, houseId: reader.houseId, readerId: reader.id, event: 'BACKOFF', consecutiveFailures: runner.consecutiveFailures, delayMs: backoffMs, status: stateForSchedule?.status || null });
+        runner.nextScheduledAt = Date.now() + backoffMs;
+        if (LOOP_TRACE_ENABLED) {
+          this.engine.log('readers', 'NEXT_RUN_SCHEDULED', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            delayMs: Number(backoffMs || 0),
+            expectedAt: new Date(runner.nextScheduledAt).toISOString(),
+            reason: runner.consecutiveFailures > 0 ? 'BACKOFF' : 'NORMAL',
+          }).catch(() => null);
+        }
+        runner.timer = setTimeout(cycle, backoffMs);
+        runner.timer.unref?.();
+      }
+    };
+    cycle();
+  }
+
+  stopReader(id) {
+    const runner = this.runners.get(id);
+    if (runner) {
+      runner.stopped = true;
+      if (runner.timer) clearTimeout(runner.timer);
+      this.runners.delete(id);
+      if (LOOP_TRACE_ENABLED) {
+        const reader = this.states.get(id);
+        this.engine.log('readers', 'LOOP_STOPPED', {
+          readerId: id,
+          houseId: reader?.houseId || null,
+          stoppedAt: new Date().toISOString(),
+        }).catch(() => null);
+      }
+    }
+    const state = this.states.get(id);
+    if (state) state.status = 'inactive';
+  }
+
+  async setOperationalMode(mode) {
+    const target = String(mode || '').toUpperCase();
+    if (!['ONLINE', 'OFFLINE'].includes(target)) throw new Error('Modo operacional inválido.');
+    if (target === 'ONLINE') await this.initialize({ start: false });
+    const readers = await this.generator.list();
+    if (target === 'OFFLINE') {
+      this.pausedReaderIds = new Set(readers.filter((reader) => reader.active).map((reader) => reader.id));
+      for (const reader of readers) {
+        if (reader.active) await this.setReaderActive(reader.id, false);
+      }
+      this.operationalMode = 'OFFLINE';
+      const { arbitrageEngineService } = require('./arbitrageEngineService');
+      await arbitrageEngineService.shutdown();
+    } else {
+      const restore = this.pausedReaderIds.size ? this.pausedReaderIds : new Set(readers.map((reader) => reader.id));
+      for (const reader of readers) {
+        if (restore.has(reader.id) && !reader.active) await this.setReaderActive(reader.id, true);
+      }
+      this.pausedReaderIds.clear();
+      this.operationalMode = 'ONLINE';
+      const { arbitrageEngineService } = require('./arbitrageEngineService');
+      await arbitrageEngineService.initialize();
+    }
+    return { mode: this.operationalMode, readers: (await this.generator.list()).map((r) => ({ id: r.id, houseId: r.houseId, active: r.active })) };
+  }
+
+  async setReaderActive(id, active) {
+    const reader = await this.generator.setActive(id, active);
+    if (active) this.startReader({ ...reader, id });
+    else this.stopReader(id);
+    return reader;
+  }
+
+  async syncHouseActive(houseId, active) {
+    const syncStartedAt = Date.now();
+    writeConnectionDiagnostic({ event: 'HOUSE_SYNC_START', houseId, requestedActive: Boolean(active) });
+    // PATCH 76: never scan/repair every active house just because one button was
+    // clicked. Only the requested house may perform profile discovery here.
+    writeMemoryLog('BEFORE_HOUSE_BOOTSTRAP', { houseId, active: Boolean(active) });
+    await this.initialize({ start: false, ensureProfiles: false });
+    if (active) {
+      try {
+        const { discoveryEngineService } = require('./discoveryEngineService');
+        const house = (await discoveryEngineService.listHouses()).find((item) => String(item.id) === String(houseId));
+        if (house) await this.ensureHouseProfile(discoveryEngineService, house);
+      } catch (error) {
+        writeHealthLog({ houseId, event: 'TARGET_PROFILE_ENSURE_FAIL', error: String(error?.message || error).slice(0, 240) });
+        writeConnectionDiagnostic({ event: 'HOUSE_PROFILE_FAIL', houseId, requestedActive: true, elapsedMs: Date.now() - syncStartedAt, error: String(error?.stack || error?.message || error).slice(0, 2000) });
+        throw error;
+      }
+    }
+    // PATCH 77: captureHouse cleanup must finish before generating/starting the reader.
+    // A short settle prevents the next live collection from overlapping Chromium teardown.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const memBeforeReader = process.memoryUsage();
+    writeHealthLog({ houseId, event: 'PRE_READER_START_MEMORY', heapUsedMB: Math.round(memBeforeReader.heapUsed/1048576), rssMB: Math.round(memBeforeReader.rss/1048576) });
+    writeMemoryLog('AFTER_BOOTSTRAP_BEFORE_LIVE_READER', { houseId, active: Boolean(active) });
+    const readers = await this.generator.generateAll();
+    const houseReaders = [...new Map(readers.filter((reader) => String(reader.houseId) === String(houseId)).map((reader) => [reader.id, reader])).values()];
+    if (!houseReaders.length && active) { writeConnectionDiagnostic({ event: 'HOUSE_NO_READER', houseId, requestedActive: true, elapsedMs: Date.now() - syncStartedAt }); throw new Error('Nenhum reader foi gerado para esta casa. Verifique se o profile Discovery e valido.'); }
+
+    for (const reader of houseReaders) {
+      if (active && reader.active && !reader.blocked) this.startReader(reader);
+      else this.stopReader(reader.id);
+    }
+
+    // PATCH 92: reconcile every already-enabled generated reader after each house
+    // activation. PATCH 91 logs proved SUPERBET was the only one of 15 houses for
+    // which CONNECT ALL never reached syncHouseActive (14 HOUSE_SYNC_START events).
+    // This does not enable disabled houses; it only starts readers already marked
+    // active by the persisted house configuration, closing that orchestration gap.
+    const reconciliationReaders = await this.generator.generateAll();
+    const recoveredReaders = [];
+    for (const candidate of reconciliationReaders) {
+      if (!candidate.active || candidate.blocked || this.runners.has(candidate.id)) continue;
+      this.startReader(candidate);
+      recoveredReaders.push({ readerId: candidate.id, houseId: candidate.houseId, house: candidate.houseName });
+    }
+    if (recoveredReaders.length) {
+      writeConnectionDiagnostic({ event: 'ACTIVE_READER_RECONCILIATION', triggerHouseId: houseId, recoveredReaders });
+    }
+    writeMemoryLog('AFTER_LIVE_READER_CREATED', { houseId, active: Boolean(active), readerIds: houseReaders.map((reader) => reader.id), recoveredReaders: recoveredReaders.map((item) => item.readerId) });
+
+    const allReaders = await this.generator.list();
+    const anyActive = allReaders.some((reader) => reader.active && !reader.blocked);
+    const { arbitrageEngineService } = require('./arbitrageEngineService');
+    if (anyActive) {
+      this.operationalMode = 'ONLINE';
+      await arbitrageEngineService.initialize();
+    } else {
+      this.operationalMode = 'OFFLINE';
+      await arbitrageEngineService.shutdown();
+    }
+    await this.engine.log('readers', 'house.active.synced', { houseId, active: Boolean(active), readers: houseReaders.map((reader) => reader.id), operationalMode: this.operationalMode });
+    writeMemoryLog('BEFORE_NEXT_HOUSE', { houseId, active: Boolean(active), readerIds: houseReaders.map((reader) => reader.id) });
+    writeConnectionDiagnostic({ event: 'HOUSE_SYNC_COMPLETE', houseId, requestedActive: Boolean(active), elapsedMs: Date.now() - syncStartedAt, readerIds: houseReaders.map((reader) => reader.id), mode: this.operationalMode });
+    return { houseId, active: Boolean(active), readers: houseReaders.map((reader) => reader.id), mode: this.operationalMode };
+  }
+
+  async removeHouse(houseId) {
+    await this.engine.initialize();
+    const removed = await this.generator.removeByHouse(houseId);
+    for (const id of removed) {
+      this.stopReader(id);
+      this.states.delete(id);
+    }
+    await this.engine.removeHouseData(houseId);
+    await this.engine.log('readers', 'readers.removed-with-house', { houseId, readers: removed.length });
+    return removed;
+  }
+
+  buildFetchRequest(endpoint, reader) {
+    const method = normalizeMethod(endpoint.method);
+    const houseName = String(reader?.houseName || '').trim().toUpperCase();
+    const isNovibet = houseName === 'NOVIBET';
+    const headers = {
+      Accept: 'application/json',
+      // PATCH 93: public sportsbook APIs increasingly reject synthetic/non-browser UAs.
+      // Keep credential policy unchanged, but use the same browser family used by Discovery.
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+      'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+      ...sanitizeHeaders(endpoint.headers, { allowSessionHeaders: isNovibet }),
+    };
+    if (isNovibet) {
+      headers.Referer ||= 'https://www.novibet.bet.br/';
+      headers.Origin ||= 'https://www.novibet.bet.br';
+      headers['Accept-Language'] ||= 'pt-BR,pt;q=0.9,en;q=0.8';
+      headers['Sec-Fetch-Site'] ||= 'same-origin';
+    }
+    const body = resolveBody(endpoint, method);
+    if (body !== undefined && !Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/json';
+    }
+    return {
+      method,
+      headers,
+      body,
+      timeoutMs: reader.timeoutMs,
+      url: normalizeBetfairExchangeRequestUrl(endpoint.url),
+    };
+  }
+
+  async fetchRaw({ url, method, headers, body, timeoutMs, heartbeatPulse }) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const heartbeatTimer = setInterval(() => {
+      if (typeof heartbeatPulse === 'function') heartbeatPulse();
+    }, 5000);
+    const started = Date.now();
+    try {
+      const response = await fetch(url, {
+        method,
+        headers,
+        body,
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentType = response.headers.get('content-type') || '';
+      if (!/json/i.test(contentType)) {
+        return {
+          payload: null,
+          latencyMs: Date.now() - started,
+          contentType,
+        };
+      }
+      const payload = await response.json();
+      return {
+        payload,
+        latencyMs: Date.now() - started,
+        contentType,
+      };
+    } finally {
+      clearTimeout(timeout);
+      clearInterval(heartbeatTimer);
+    }
+  }
+
+  async fetchEndpoint(reader, endpoint, state) {
+    let lastError;
+    for (let attempt = 0; attempt <= reader.maxRetries; attempt += 1) {
+      try {
+        const request = this.buildFetchRequest(endpoint, reader);
+        const requestStartedAt = Date.now();
+        const requestStart = new Date().toISOString();
+        const response = await this.fetchRaw({
+          ...request,
+          heartbeatPulse: () => {
+            state.heartbeatAt = new Date().toISOString();
+            state.heartbeatPulseCount = Number(state.heartbeatPulseCount || 0) + 1;
+          },
+        });
+        if (!state.firstSuccessfulRequestAt) state.firstSuccessfulRequestAt = new Date().toISOString();
+        if (response.payload === null) {
+          if (PERF_TRACE_ENABLED) {
+            this.engine.log('readers', 'reader.request.metrics', {
+              readerId: reader.id,
+              houseId: reader.houseId,
+              endpoint: endpoint.url,
+              method: request.method,
+              attempt: attempt + 1,
+              requestStart,
+              requestEnd: new Date().toISOString(),
+              requestDurationMs: Date.now() - requestStartedAt,
+              acceptedRecords: 0,
+              freshOdds: 0,
+              payloadType: 'NON_JSON_OR_EMPTY',
+            }).catch(() => null);
+          }
+          return { records: [], latencyMs: response.latencyMs, payload: null };
+        }
+
+        if (PERF_TRACE_ENABLED) {
+          const schemaHash = crypto
+            .createHash('sha256')
+            .update(JSON.stringify(structure(response.payload)))
+            .digest('hex');
+          const key = `${reader.id}:${request.method}:${endpoint.url}`;
+          if (state.schemas?.[key] && state.schemas[key] !== schemaHash) {
+            state.structuralChanges += 1;
+            const alert = {
+              type: 'structural-change',
+              endpoint: endpoint.url,
+              method: request.method,
+              timestamp: new Date().toISOString(),
+            };
+            state.alerts = [...(state.alerts || []).slice(-99), alert];
+            await this.engine.log('readers', 'reader.structure.changed', {
+              readerId: reader.id,
+              endpoint: endpoint.url,
+              method: request.method,
+            });
+          }
+          state.schemas = state.schemas || {};
+          state.schemas[key] = schemaHash;
+        }
+
+        // Refresh heartbeat on each successful endpoint response so long-running cycles (e.g. BETFAIR 487 endpoints) do not expire mid-cycle
+        state.heartbeatAt = new Date().toISOString();
+        const normalizedRecords = normalizePayload(response.payload, {
+          houseId: reader.houseId,
+          readerId: reader.id,
+          endpoint: endpoint.url,
+          houseName: reader.houseName,
+        });
+        if (normalizedRecords.length > 0 && !state.firstAcceptedRecordAt) {
+          state.firstAcceptedRecordAt = new Date().toISOString();
+        }
+        const requestFreshOdds = normalizedRecords.filter((item) => Number(item?.prices?.odd || 0) > 0).length;
+        if (requestFreshOdds > 0) {
+          const ts = new Date().toISOString();
+          state.lastFreshAt = ts;
+          state.freshOdds = requestFreshOdds;
+          if (!state.firstFreshAt) state.firstFreshAt = ts;
+        }
+        if (PERF_TRACE_ENABLED) {
+          this.engine.log('readers', 'reader.request.metrics', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            endpoint: endpoint.url,
+            method: request.method,
+            attempt: attempt + 1,
+            requestStart,
+            requestEnd: new Date().toISOString(),
+            requestDurationMs: Date.now() - requestStartedAt,
+            acceptedRecords: normalizedRecords.length,
+            freshOdds: requestFreshOdds,
+            payloadType: 'JSON',
+          }).catch(() => null);
+        }
+        return {
+          records: normalizedRecords,
+          latencyMs: response.latencyMs,
+          payload: response.payload,
+        };
+      } catch (error) {
+        lastError = error;
+        state.retries += 1;
+        state.heartbeatAt = new Date().toISOString();
+        const message = String(error.message || '');
+        // 429 Too Many Requests is transient — do not treat as a hard error
+        const isRateLimit = /\b429\b/.test(message);
+        const hardClientError = !isRateLimit && (/^HTTP 4\d\d\b/.test(message) || /\b4\d\d\b/.test(message));
+        if (PERF_TRACE_ENABLED) {
+          this.engine.log('readers', 'reader.request.metrics', {
+            readerId: reader.id,
+            houseId: reader.houseId,
+            endpoint: endpoint.url,
+            method: String(endpoint?.method || 'GET').toUpperCase(),
+            attempt: attempt + 1,
+            requestStart: new Date(Date.now() - Math.max(0, Number(reader.timeoutMs || 0))).toISOString(),
+            requestEnd: new Date().toISOString(),
+            requestDurationMs: Number(reader.timeoutMs || 0),
+            acceptedRecords: 0,
+            freshOdds: 0,
+            failed: true,
+            error: message,
+          }).catch(() => null);
+        }
+
+        if (hardClientError && /HTTP 400/.test(message) && /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(String(endpoint?.url || ''))) {
+          const marketIdsParam = getSearchParam(endpoint.url, 'marketIds');
+          const ids = String(marketIdsParam || '')
+            .split(',')
+            .map((id) => String(id || '').trim())
+            .filter(Boolean);
+          if (ids.length > 1) {
+            const midpoint = Math.ceil(ids.length / 2);
+            const groups = [ids.slice(0, midpoint), ids.slice(midpoint)].filter((group) => group.length > 0);
+            const merged = { records: [], latencyMs: 0, payload: null };
+            const childErrors = [];
+            for (const group of groups) {
+              const childEndpoint = this.buildDynamicEndpointFromCatalog(endpoint, { marketIds: group });
+              const childReader = { ...reader, maxRetries: 0 };
+              try {
+                const child = await this.fetchEndpoint(childReader, childEndpoint, state);
+                merged.records.push(...(child.records || []));
+                merged.latencyMs += Number(child.latencyMs || 0);
+              } catch (childError) {
+                childErrors.push(childError.message);
+              }
+            }
+            if (!merged.records.length && childErrors.length) {
+              throw new Error(`HTTP 400 split fallback failed: ${childErrors.slice(0, 4).join(' | ')}`);
+            }
+            if (childErrors.length) {
+              await this.engine.log('readers', 'reader.endpoint.partial-recovery', {
+                readerId: reader.id,
+                endpoint: endpoint.url,
+                totalGroups: groups.length,
+                failedGroups: childErrors.length,
+              });
+            }
+            return merged;
+          }
+        }
+
+        if (hardClientError) {
+          // PATCH 93: a permanently forbidden auxiliary/stale endpoint must not destabilize
+          // the whole house every cycle. Quarantine it temporarily; Discovery can refresh it.
+          reader.__endpointQuarantine ||= new Map();
+          const quarantineMs = 15 * 60 * 1000;
+          reader.__endpointQuarantine.set(String(endpoint?.url || ''), Date.now() + quarantineMs);
+          writeConnectionDiagnostic({ event: 'ENDPOINT_QUARANTINED', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, endpoint: String(endpoint?.url || '').slice(0, 500), error: message.slice(0, 200), quarantineMs });
+          break;
+        }
+        const baseDelay = isRateLimit ? Math.max(reader.reconnectDelayMs * 3, 2000) : reader.reconnectDelayMs;
+        if (attempt < reader.maxRetries) await wait(baseDelay * (attempt + 1));
+      }
+    }
+    throw lastError;
+  }
+
+  getCatalogCandidates(reader = {}) {
+    const endpoints = (reader.endpoints || []).filter((endpoint) => looksLikeCatalogEndpoint(endpoint));
+    return endpoints.sort((left, right) => Number(right.utilityScore || 0) - Number(left.utilityScore || 0));
+  }
+
+  buildDynamicEndpointFromCatalog(baseEndpoint = {}, options = {}) {
+    const endpoint = {
+      ...baseEndpoint,
+      headers: { ...(baseEndpoint.headers || {}) },
+      queryParameters: { ...(baseEndpoint.queryParameters || {}) },
+      marketIds: [...(baseEndpoint.marketIds || [])],
+      body: cloneValue(baseEndpoint.body),
+    };
+
+    const window = options.window;
+    if (window) {
+      const beforeSeconds = Math.floor(window.to / 1000);
+      if (hasSearchParam(endpoint.url, 'before') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'before')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'before', beforeSeconds);
+      }
+      if (hasSearchParam(endpoint.url, 'after') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'after')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'after', Math.floor(window.from / 1000));
+      }
+    }
+
+    if (options.offset !== undefined && options.offset !== null) {
+      if (hasSearchParam(endpoint.url, 'offset') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'offset')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'offset', options.offset);
+      }
+      if (hasSearchParam(endpoint.url, 'page') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'page')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'page', options.offset);
+      }
+    }
+
+    if (options.limit !== undefined && options.limit !== null) {
+      if (hasSearchParam(endpoint.url, 'per-page') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'per-page')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'per-page', options.limit);
+      }
+      if (hasSearchParam(endpoint.url, 'per_page') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'per_page')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'per_page', options.limit);
+      }
+      if (hasSearchParam(endpoint.url, 'limit') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'limit')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'limit', options.limit);
+      }
+      if (hasSearchParam(endpoint.url, 'markets-limit') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'markets-limit')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'markets-limit', options.limit);
+      }
+    }
+
+    if (options.nextCursor) {
+      if (hasSearchParam(endpoint.url, 'cursor') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'cursor')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'cursor', options.nextCursor);
+      }
+      if (hasSearchParam(endpoint.url, 'next') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'next')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'next', options.nextCursor);
+      }
+    }
+
+    if (Array.isArray(options.marketIds) && options.marketIds.length) {
+      const ids = options.marketIds.map((id) => String(id));
+      endpoint.marketIds = ids;
+      if (hasSearchParam(endpoint.url, 'marketIds') || /marketIds=/i.test(endpoint.url)) {
+        endpoint.url = updateSearchParam(endpoint.url, 'marketIds', ids.join(','));
+      }
+      if (Array.isArray(endpoint.body)) endpoint.body = ids;
+      else if (endpoint.body && typeof endpoint.body === 'object') {
+        if (Array.isArray(endpoint.body.marketIds)) endpoint.body = { ...endpoint.body, marketIds: ids };
+        if (Array.isArray(endpoint.body.markets)) endpoint.body = { ...endpoint.body, markets: ids };
+      }
+    }
+
+    return endpoint;
+  }
+
+  async enumerateCatalog(reader, state, runOptions = {}) {
+    const window = buildOperationalWindow(reader, runOptions);
+    const catalogRefreshMs = Math.max(15000, Number(runOptions.catalogRefreshMs ?? process.env.FALLAH_CATALOG_REFRESH_MS ?? 45000));
+    const lastRefreshTs = parseIso(state?.lastCatalogCache?.refreshedAt);
+    if (
+      Number.isFinite(lastRefreshTs)
+      && (Date.now() - lastRefreshTs) < catalogRefreshMs
+      && Array.isArray(state?.lastCatalogCache?.dynamicMarketIds)
+      && state.lastCatalogCache.dynamicMarketIds.length > 0
+    ) {
+      // PATCH 112: a cache hit previously returned only market IDs and an empty payload list.
+      // buildCatalogSnapshot() then produced an empty/invalid catalog, so the same reader that
+      // had just discovered hundreds of events fed ZERO events into the downstream matching path.
+      // Restore the already-persisted per-house catalog on cache hits instead of fabricating an
+      // empty snapshot. This keeps the RAM-saving cache while preserving the event/market graph.
+      const persistedCatalogs = await this.engine.currentCatalogs().catch(() => null);
+      const persistedHouseCatalog = persistedCatalogs?.houses?.[reader.houseId];
+      const persistedUsable = Boolean(
+        persistedHouseCatalog?.valid
+        && Object.keys(persistedHouseCatalog.events || {}).length > 0
+        && Object.keys(persistedHouseCatalog.markets || {}).length > 0
+      );
+
+      if (persistedUsable) {
+        await this.engine.log('readers', 'reader.catalog.cache-restored', {
+          readerId: reader.id,
+          houseId: reader.houseId,
+          houseName: reader.houseName,
+          events: Object.keys(persistedHouseCatalog.events || {}).length,
+          markets: Object.keys(persistedHouseCatalog.markets || {}).length,
+          dynamicMarketIds: state.lastCatalogCache.dynamicMarketIds.length,
+        });
+        return {
+          window,
+          payloads: [],
+          compactSnapshot: persistedHouseCatalog,
+          dynamicMarketIds: [...state.lastCatalogCache.dynamicMarketIds],
+          endpointSummaries: (state.lastCatalogCache.endpointSummaries || []).map((item) => ({ ...item, cached: true })),
+          completed: true,
+          paginated: Boolean(state.lastCatalogCache.paginated),
+        };
+      }
+
+      // No valid persisted graph exists: invalidate only the lightweight cache and perform a
+      // real catalog refresh now. Never allow an empty synthetic catalog to continue downstream.
+      state.lastCatalogCache = null;
+      await this.engine.log('readers', 'reader.catalog.cache-invalidated', {
+        readerId: reader.id, houseId: reader.houseId, houseName: reader.houseName, reason: 'PERSISTED_CATALOG_MISSING_OR_EMPTY'
+      });
+    }
+
+    const candidates = this.getCatalogCandidates(reader);
+    const maxCatalogEndpoints = parsePositiveLimit(
+      runOptions.maxCatalogEndpoints ?? process.env.FALLAH_MAX_CATALOG_ENDPOINTS,
+      Number.POSITIVE_INFINITY
+    );
+    const maxCatalogPages = parsePositiveLimit(
+      runOptions.maxCatalogPages ?? process.env.FALLAH_MAX_CATALOG_PAGES,
+      Number.POSITIVE_INFINITY
+    );
+    const defaultPageSize = Math.max(20, Math.min(500, Number(runOptions.pageSize || 100)));
+
+    const selectedCandidates = Number.isFinite(maxCatalogEndpoints) ? candidates.slice(0, maxCatalogEndpoints) : [...candidates];
+    const candidateVariants = dedupeBy(
+      selectedCandidates.flatMap((candidate) => {
+        const relaxed = relaxCatalogEndpointFilters(candidate);
+        return relaxed ? [candidate, relaxed] : [candidate];
+      }),
+      (item) => `${normalizeMethod(item.method)} ${String(item.url || '')}`,
+    );
+    // PATCH 80: catalog pages are compacted immediately into metadata and then
+    // released. Large books (BET365/BETANO/SUPERBET) must not retain every raw
+    // response page until the end of the cycle. This preserves the complete
+    // event/market catalog while bounding RAM to roughly one fetched page.
+    const payloads = []; // kept empty intentionally; compatibility field only
+    const endpointSummaries = [];
+    const compactSnapshot = {
+      schema: 'fallah.current-catalog/v1',
+      houseId: reader.houseId, houseName: reader.houseName, sourceType: reader.houseType || 'other',
+      generatedAt: new Date().toISOString(),
+      windowFrom: new Date(window.from).toISOString(), windowTo: new Date(window.to).toISOString(),
+      endpointSummaries, sports: {}, competitions: {}, events: {}, markets: {}, activeMarketIds: [], valid: false,
+    };
+
+    for (const base of candidateVariants) {
+      let offset = 0;
+      let cursor = null;
+      let pages = 0;
+      let continuePagination = true;
+      let fetchedAtLeastOnePage = false;
+      let failed = false;
+      let failureReason = null;
+      const seenPageSignatures = new Set();
+
+      while (continuePagination && (!Number.isFinite(maxCatalogPages) || pages < maxCatalogPages)) {
+        const endpoint = this.buildDynamicEndpointFromCatalog(base, {
+          window,
+          offset,
+          limit: defaultPageSize,
+          nextCursor: cursor,
+        });
+
+        let capture;
+        try {
+          capture = await this.fetchEndpoint(reader, endpoint, state);
+        } catch (error) {
+          failed = true;
+          failureReason = error.message;
+          await this.engine.log('readers', 'reader.catalog.endpoint.failed', {
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            error: error.message,
+          });
+          break;
+        }
+        fetchedAtLeastOnePage = true;
+        pages += 1;
+        const rawOriginAudit = patch134SnapshotSummary(capture.payload, reader, window);
+        const payloadFiltered = filterPayloadByWindow(capture.payload, window);
+        const filteredOriginAudit = patch134SnapshotSummary(payloadFiltered || capture.payload, reader, window);
+
+        patch134AppendMaster('READER_ORIGIN_PAGE_AUDIT', {
+          houseId: reader.houseId,
+          house: reader.houseName,
+          houseType: reader.houseType || 'other',
+          endpoint: endpoint.url,
+          page: pages,
+          window: {
+            mode: window.mode,
+            timezone: window.timezone,
+            from: new Date(window.from).toISOString(),
+            to: new Date(window.to).toISOString(),
+          },
+          raw: rawOriginAudit,
+          afterTwoDayFilter: filteredOriginAudit,
+        });
+
+        const compactPayload = payloadFiltered || capture.payload;
+        collectFacetCatalog(compactPayload, compactSnapshot);
+        collectSportsMenuCatalog(compactPayload, compactSnapshot);
+        collectStructuredCatalog(compactPayload, compactSnapshot);
+
+        // Break pagination when provider keeps returning the same page despite offset/cursor changes.
+        // Hash only the current page; do not retain it after this iteration.
+        // PATCH 86: never stringify a complete provider payload only to detect
+        // pagination loops. Large sportsbook/exchange responses can exceed V8's
+        // maximum string size ("Invalid string length") and spike RSS. Build a
+        // bounded signature from pagination metadata plus a small identity sample.
+        const signatureParts = [];
+        const addSignatureValue = (value) => {
+          if (value === null || value === undefined) return;
+          const text = String(value);
+          if (text) signatureParts.push(text.slice(0, 256));
+        };
+        const sampleItems = (items) => {
+          if (!Array.isArray(items)) return;
+          for (const item of items.slice(0, 12)) {
+            if (!item || typeof item !== 'object') { addSignatureValue(item); continue; }
+            addSignatureValue(item.id ?? item.eventId ?? item.marketId ?? item.key ?? item.name);
+          }
+          signatureParts.push(`len:${items.length}`);
+        };
+        addSignatureValue(endpoint.url);
+        addSignatureValue(compactPayload?.total);
+        addSignatureValue(compactPayload?.offset);
+        addSignatureValue(compactPayload?.next ?? compactPayload?.nextCursor ?? compactPayload?.cursor?.next);
+        sampleItems(compactPayload?.events);
+        sampleItems(compactPayload?.markets);
+        sampleItems(compactPayload?.leagues);
+        sampleItems(compactPayload?.eventTypes);
+        if (!signatureParts.length && compactPayload && typeof compactPayload === 'object') {
+          signatureParts.push(Object.keys(compactPayload).slice(0, 64).join(','));
+        }
+        const pageSignature = crypto
+          .createHash('sha256')
+          .update(signatureParts.join('|'))
+          .digest('hex');
+        if (seenPageSignatures.has(pageSignature)) {
+          await this.engine.log('readers', 'reader.catalog.pagination.stalled', {
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            pages,
+          });
+          break;
+        }
+        seenPageSignatures.add(pageSignature);
+
+        const pageMeta = extractPaginationMeta(compactPayload || {}, endpoint.url);
+        if (pageMeta.hasNextCursor && pageMeta.nextCursor && pageMeta.nextCursor !== cursor) {
+          cursor = pageMeta.nextCursor;
+          continue;
+        }
+
+        if (hasRemainingByPagination(pageMeta)) {
+          offset += Number.isFinite(pageMeta.limit) && pageMeta.limit > 0 ? pageMeta.limit : defaultPageSize;
+          continue;
+        }
+
+        if (endpointHasPaginationHints(endpoint)) {
+          if (Number.isFinite(pageMeta.itemsCount) && Number.isFinite(pageMeta.limit) && pageMeta.itemsCount >= pageMeta.limit) {
+            offset += pageMeta.limit;
+            continue;
+          }
+        }
+
+        continuePagination = false;
+      }
+
+      endpointSummaries.push({
+        endpoint: base.url,
+        pages,
+        completed: fetchedAtLeastOnePage,
+        failed,
+        failureReason,
+      });
+    }
+
+    const finalizedCompactSnapshot = finalizeCatalogSnapshot(compactSnapshot);
+    const dynamicMarketIds = [...new Set(finalizedCompactSnapshot.activeMarketIds || [])];
+    state.lastCatalogCache = {
+      refreshedAt: new Date().toISOString(),
+      dynamicMarketIds: [...dynamicMarketIds],
+      endpointSummaries,
+      paginated: endpointSummaries.some((entry) => entry.pages > 1),
+    };
+    const patch134CatalogAudit = patch134SnapshotSummary(finalizedCompactSnapshot, reader, window);
+    patch134AppendMaster('READER_CATALOG_2DAY_SUMMARY', {
+      houseId: reader.houseId,
+      house: reader.houseName,
+      houseType: reader.houseType || 'other',
+      endpointsConsulted: endpointSummaries.length,
+      pagesConsulted: endpointSummaries.reduce((sum, entry) => sum + Number(entry.pages || 0), 0),
+      paginated: endpointSummaries.some((entry) => Number(entry.pages || 0) > 1),
+      window: {
+        mode: window.mode,
+        timezone: window.timezone,
+        from: new Date(window.from).toISOString(),
+        to: new Date(window.to).toISOString(),
+      },
+      catalog: patch134CatalogAudit,
+    });
+
+    state.lastCatalog = {
+      windowFrom: new Date(window.from).toISOString(),
+      windowTo: new Date(window.to).toISOString(),
+      endpointCount: endpointSummaries.length,
+      endpointSummaries,
+      marketIds: dynamicMarketIds.length,
+      completed: endpointSummaries.some((entry) => entry.completed),
+      paginated: endpointSummaries.some((entry) => entry.pages > 1),
+    };
+
+    return {
+      window,
+      payloads,
+      compactSnapshot: finalizedCompactSnapshot,
+      dynamicMarketIds,
+      endpointSummaries,
+      completed: state.lastCatalog.completed,
+      paginated: state.lastCatalog.paginated,
+    };
+  }
+
+  buildExecutionPlan(reader, catalog, runOptions = {}) {
+    let dynamicIds = catalog.dynamicMarketIds || [];
+    const endpoints = [];
+    const exchangeReader = String(reader.houseType || '').toLowerCase() === 'exchange';
+    const richExchangeAvailable = exchangeReader && (reader.endpoints || []).some((endpoint) => isRichExchangeMarketEndpoint(endpoint));
+    const betfairExchangeOnly = String(reader.houseName || '').toUpperCase() === 'BETFAIR';
+    const fulltbetExchangeReader = String(reader.houseName || '').toUpperCase() === 'FULLTBET';
+    let betfairRichTemplateConsumed = false;
+
+    dynamicIds = dedupeBy((dynamicIds || []).map((id) => String(id || '').trim()).filter(Boolean), (id) => id);
+
+    // BETFAIR exchange bymarket accepts exchange market IDs in dotted numeric format (e.g. 1.260123456).
+    // Filtering here prevents catalog/event IDs from polluting the execution plan and causing mass HTTP 400.
+    if (betfairExchangeOnly) {
+      dynamicIds = dynamicIds.filter((id) => /^\d+\.\d+$/.test(String(id)));
+    }
+
+    const structuredExchangeMarketIds = (() => {
+      if (!exchangeReader) return [];
+      const marketSnapshot = { sports: {}, competitions: {}, events: {}, markets: {} };
+      for (const item of catalog.payloads || []) {
+        collectFacetCatalog(item.payload, marketSnapshot);
+        collectStructuredCatalog(item.payload, marketSnapshot);
+      }
+      return Object.keys(marketSnapshot.markets || {});
+    })();
+
+    if (structuredExchangeMarketIds.length) {
+      dynamicIds = structuredExchangeMarketIds;
+    }
+
+    if (fulltbetExchangeReader) {
+      const marketSnapshot = { sports: {}, competitions: {}, events: {}, markets: {} };
+      for (const item of catalog.payloads || []) {
+        collectFacetCatalog(item.payload, marketSnapshot);
+        collectStructuredCatalog(item.payload, marketSnapshot);
+      }
+      const marketIds = Object.keys(marketSnapshot.markets || {});
+      if (marketIds.length) dynamicIds = marketIds;
+    }
+
+    // structuredExchangeMarketIds may replace the already-filtered list above.
+    // Re-apply Betfair's exchange market-id contract after every catalog source is merged.
+    // This prevents event/catalog identifiers from being sent to /bymarket and silently
+    // collapsing price coverage behind HTTP 400/fallback behavior.
+    if (betfairExchangeOnly) {
+      dynamicIds = dedupeBy(
+        dynamicIds.filter((id) => /^\d+\.\d+$/.test(String(id || '').trim())),
+        (id) => id,
+      );
+    }
+
+    const nowMs = Date.now();
+    const endpointQuarantine = reader.__endpointQuarantine instanceof Map ? reader.__endpointQuarantine : new Map();
+    reader.__endpointQuarantine = endpointQuarantine;
+    for (const endpoint of reader.endpoints || []) {
+      const url = String(endpoint.url || '').toLowerCase();
+      if (looksNonSportsEndpoint(url)) continue;
+      const quarantineUntil = Number(endpointQuarantine.get(String(endpoint.url || '')) || 0);
+      if (quarantineUntil > nowMs) continue;
+      if (quarantineUntil) endpointQuarantine.delete(String(endpoint.url || ''));
+      if (Number(endpoint.utilityScore || 0) < 4) continue;
+      if (betfairExchangeOnly && exchangeReader && !/\/sports\/exchange\/|\/inplayservice\//i.test(url)) continue;
+      if (exchangeReader && richExchangeAvailable && !isRichExchangeMarketEndpoint(endpoint)) continue;
+      const hasMarketIds = /marketids=/.test(url) || hasSearchParam(endpoint.url, 'marketIds') || Array.isArray(endpoint.marketIds) || Array.isArray(endpoint.body);
+      if (hasMarketIds && dynamicIds.length) {
+        const isBetfairByMarket = betfairExchangeOnly && /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(url);
+        if (isBetfairByMarket && betfairRichTemplateConsumed) continue;
+        const marketIdChunkSize = /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(url)
+          ? 10
+          : 50;
+        for (const group of chunk(dynamicIds, marketIdChunkSize)) {
+          endpoints.push(this.buildDynamicEndpointFromCatalog(endpoint, { marketIds: group, window: catalog.window }));
+        }
+        if (isBetfairByMarket) betfairRichTemplateConsumed = true;
+        continue;
+      }
+      endpoints.push(this.buildDynamicEndpointFromCatalog(endpoint, { window: catalog.window }));
+    }
+
+    if (endpoints.length === 0 && exchangeReader) {
+      const houseName = String(reader.houseName || '').trim().toUpperCase();
+      const syntheticBlocked = new Set(['BET365', 'NOVIBET', 'BETANO', 'SUPERBET', '1XBET', 'ESTRELA BET', 'ESPORTIVA BET', 'SEGURO BET']);
+      if (!syntheticBlocked.has(houseName)) {
+        const synthetic = buildSyntheticExchangeEndpointsFromReader(reader);
+        for (const endpoint of synthetic) {
+          endpoints.push(this.buildDynamicEndpointFromCatalog(endpoint, { window: catalog.window }));
+        }
+      } else {
+        writeConnectionDiagnostic({ event: 'SYNTHETIC_EXCHANGE_BLOCKED', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, reason: 'KNOWN_SPORTSBOOK_PROFILE_MISCLASSIFICATION_GUARD' });
+      }
+    }
+
+    const deduped = dedupeBy(endpoints, (endpoint) => {
+      const method = normalizeMethod(endpoint.method);
+      const body = resolveBody(endpoint, method) || '';
+      return `${method} ${endpoint.url} ${body}`;
+    });
+    deduped.sort((left, right) => executionPriority(reader, right) - executionPriority(reader, left));
+
+    const maxExecutionEndpoints = parsePositiveLimit(
+      runOptions.maxExecutionEndpoints ?? process.env.FALLAH_MAX_EXECUTION_ENDPOINTS,
+      Number.POSITIVE_INFINITY
+    );
+    const hasDynamicCoveragePlan = deduped.some((endpoint) => extractEndpointMarketIds(endpoint).length > 0);
+    // Never silently truncate dynamic market coverage. If IDs were discovered for the window,
+    // the execution plan must process all chunks for those IDs.
+    if (hasDynamicCoveragePlan) return deduped;
+
+    const limited = Number.isFinite(maxExecutionEndpoints) ? deduped.slice(0, maxExecutionEndpoints) : deduped;
+    return limited;
+  }
+
+  summarizeNormalized(normalized) {
+    const eventSet = new Set();
+    const marketSet = new Set();
+    const capabilityCounters = {
+      MARKET_DATA_CAPABILITY: 0,
+      CATALOG_CAPABILITY: 0,
+      UNKNOWN_CAPABILITY: 0,
+    };
+    for (const item of normalized || []) {
+      if (item?.event?.id) eventSet.add(String(item.event.id));
+      if (item?.market?.id) marketSet.add(String(item.market.id));
+      const capability = classifyRecordCapability(item);
+      capabilityCounters[capability] = (capabilityCounters[capability] || 0) + 1;
+    }
+    return {
+      odds: normalized.length,
+      events: eventSet.size,
+      markets: marketSet.size,
+      capabilities: capabilityCounters,
+    };
+  }
+
+  async runReader(reader, runOptions = {}) {
+    const state = this.states.get(reader.id) || {
+      readerId: reader.id,
+      houseId: reader.houseId,
+      retries: 0,
+      reconnects: 0,
+      errors: 0,
+      cycles: 0,
+      records: 0,
+      odds: 0,
+      events: 0,
+      markets: 0,
+      activeEndpoints: [],
+      structuralChanges: 0,
+      endpointChanges: 0,
+      apiChanges: 0,
+      layoutChanges: 0,
+      collectionRunning: false,
+      alerts: [],
+      lastCatalog: null,
+    };
+    this.states.set(reader.id, state);
+
+    state.status = 'running';
+    state.lastRunAt = new Date().toISOString();
+    state.heartbeatAt = state.lastRunAt;
+    state.heartbeatPulseCount = 0;
+
+    const started = Date.now();
+    const cycleStart = new Date().toISOString();
+    const cyclePulse = setInterval(() => {
+      state.heartbeatAt = new Date().toISOString();
+      state.heartbeatPulseCount = Number(state.heartbeatPulseCount || 0) + 1;
+    }, 4000);
+    cyclePulse.unref?.();
+    try {
+      const catalog = await this.enumerateCatalog(reader, state, runOptions);
+      const catalogSnapshot = buildCatalogSnapshot(reader, catalog);
+      if ((!Array.isArray(catalog.dynamicMarketIds) || !catalog.dynamicMarketIds.length) && Array.isArray(catalogSnapshot.activeMarketIds) && catalogSnapshot.activeMarketIds.length) {
+        catalog.dynamicMarketIds = [...catalogSnapshot.activeMarketIds];
+      }
+      const executionPlan = this.buildExecutionPlan(reader, catalog, runOptions);
+      writeConnectionDiagnostic({ event: 'TEMPORAL_COLLECTION_PLAN', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, executionPlanEndpoints: executionPlan.length, endpointConcurrency: Math.max(1, Math.min(12, Number(process.env.FALLAH_ENDPOINT_CONCURRENCY) || 6)), cycleStartedAt: cycleStart });
+      const planMarketIds = dedupeBy(
+        executionPlan.flatMap((endpoint) => extractEndpointMarketIds(endpoint)),
+        (id) => id,
+      );
+
+      const latencies = [];
+      const endpointErrors = [];
+      const activeEndpoints = [];
+      const endpointMetrics = [];
+      const normalizedByIdentity = new Map();
+
+      // Concurrent execution: limits event-loop saturation from readers with many endpoints (e.g. BETFAIR 487)
+      // PATCH 86: conservative default reduces simultaneous large JSON payloads in memory.
+      const CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.FALLAH_ENDPOINT_CONCURRENCY) || 6));
+      for (let i = 0; i < executionPlan.length; i += CONCURRENCY) {
+        const batch = executionPlan.slice(i, i + CONCURRENCY);
+        const settled = await Promise.allSettled(
+          batch.map((endpoint) => this.fetchEndpoint(reader, endpoint, state)),
+        );
+        for (let j = 0; j < settled.length; j++) {
+          const result = settled[j];
+          const endpoint = batch[j];
+          if (result.status === 'fulfilled') {
+            const capture = result.value;
+            activeEndpoints.push(endpoint.url);
+            latencies.push(capture.latencyMs);
+            endpointMetrics.push({ endpoint: endpoint.url, requestDurationMs: Number(capture.latencyMs || 0), failed: false });
+            for (const record of capture.records || []) {
+              const enriched = {
+                ...record,
+                // PATCH 137: preserve provenance/public-link metadata emitted by the normalizer/reader.
+                // PATCH 136 overwrote origin here, destroying any eventUrl/marketUrl/deepLink captured upstream.
+                origin: { ...(record.origin || {}), readerId: reader.id, endpoint: endpoint.url },
+                latencyMs: capture.latencyMs,
+                quality: Math.max(0, Math.min(100, 100 - Math.round(capture.latencyMs / 50))),
+                lastUpdatedAt: new Date().toISOString(),
+              };
+              const key = recordIdentityKey(enriched);
+              const current = normalizedByIdentity.get(key);
+              normalizedByIdentity.set(key, selectMoreCompleteRecord(current, enriched));
+            }
+          } else {
+            endpointErrors.push(`${endpoint.url}: ${result.reason?.message || 'unknown'}`);
+            endpointMetrics.push({ endpoint: endpoint.url, requestDurationMs: null, failed: true, error: result.reason?.message || 'unknown' });
+            await this.engine.log('readers', 'reader.endpoint.failover', {
+              readerId: reader.id,
+              endpoint: endpoint.url,
+              error: result.reason?.message || 'unknown',
+            });
+          }
+        }
+      }
+
+      if (executionPlan.length && endpointErrors.length === executionPlan.length) {
+        const hadPreviousSuccess = Boolean(state.lastSuccessAt);
+        if (!hadPreviousSuccess) {
+          throw new Error(`Todos os endpoints esportivos falharam: ${endpointErrors.join(' | ')}`);
+        }
+        state.status = 'degraded';
+        state.lastError = `ENDPOINTS_DEGRADED: ${endpointErrors.slice(0, 4).join(' | ')}`;
+        writeConnectionDiagnostic({ event: 'HOUSE_DEGRADED_KEEPALIVE', house: reader.houseName, houseId: reader.houseId, readerId: reader.id, failedEndpoints: endpointErrors.length, lastSuccessAt: state.lastSuccessAt });
+      }
+
+      const catalogUpdate = await this.engine.updateCurrentCatalog(catalogSnapshot);
+
+      const catalogRecords = buildCatalogCurrentStateRecords(catalogUpdate.snapshot || catalogSnapshot);
+      const catalogLookup = buildCatalogLookup(catalogUpdate.snapshot || catalogSnapshot);
+      const currentStateRecords = [...normalizedByIdentity.values()].map((record) => enrichCurrentStateRecordFromCatalog(record, catalogLookup));
+      const eventIdsDiscovered = Object.keys((catalogUpdate.snapshot || catalogSnapshot).events || {});
+      const marketIdsDiscovered = Object.keys((catalogUpdate.snapshot || catalogSnapshot).markets || {});
+      const marketIdsPlanned = dedupeBy(planMarketIds, (id) => id);
+      const eventIdsPlanned = dedupeBy(
+        marketIdsPlanned
+          .map((marketId) => String(catalogLookup?.markets?.[marketId]?.eventId || '').trim())
+          .filter(Boolean),
+        (id) => id,
+      );
+      const marketIdsProcessed = uniqueMarketIdsFromRecords(currentStateRecords);
+      const eventIdsProcessed = uniqueEventIdsFromRecords(currentStateRecords);
+      const chunksPlanned = executionPlan.length;
+      const failedChunks = endpointErrors.length;
+      const chunksProcessed = Math.max(0, chunksPlanned - failedChunks);
+      const plannedBase = marketIdsPlanned.length || marketIdsDiscovered.length || 0;
+      const coveragePercent = plannedBase > 0
+        ? Number(Math.min(100, (marketIdsProcessed.length / plannedBase) * 100).toFixed(2))
+        : 100;
+      const marketDataRecords = currentStateRecords.filter((record) => classifyRecordCapability(record) === 'MARKET_DATA_CAPABILITY').length;
+      const droppedByCapability = Math.max(0, Number(catalogRecords.length || 0));
+
+      // PATCH 118 — merge a fresh partial cycle over the last complete snapshot.
+      // Reader endpoints complete independently; replacing a house with a partial cycle made
+      // cross-house counts oscillate violently. Preserve the last complete snapshot when the
+      // new cycle is suspiciously incomplete, and only publish a coherent house state.
+      if (!this.lastGoodHouseRecords.has(reader.houseId)) {
+        const persisted = this.engine.houseRecords(reader.houseId);
+        if (persisted.length) this.lastGoodHouseRecords.set(reader.houseId, persisted);
+      }
+      const previousGood = this.lastGoodHouseRecords.get(reader.houseId) || [];
+      const previousCount = previousGood.length;
+      const currentCount = currentStateRecords.length;
+      const completionRatio = previousCount > 0 ? currentCount / previousCount : 1;
+      const cycleStructurallyComplete = chunksPlanned === 0 || failedChunks === 0;
+      const suspiciousPartial = previousCount > 0 && (
+        !cycleStructurallyComplete ||
+        completionRatio < 0.65 ||
+        (plannedBase > 0 && coveragePercent < 65)
+      );
+
+      let publishRecords = currentStateRecords;
+      if (suspiciousPartial) {
+        // The previous implementation kept the entire old snapshot. With even one failed
+        // chunk this made every otherwise fresh quote age out together. Merge by stable
+        // identity instead: received records become current, while missing identities are
+        // retained from the last complete snapshot. No validation rule is relaxed here.
+        publishRecords = mergeCurrentStateRecords([...previousGood, ...currentStateRecords]);
+        this.lastGoodHouseRecords.set(reader.houseId, publishRecords);
+        writeConnectionDiagnostic({
+          event: 'PARTIAL_SNAPSHOT_MERGED_WITH_LAST_GOOD',
+          house: reader.houseName, houseId: reader.houseId, readerId: reader.id,
+          previousCount, currentCount, completionRatio: Number(completionRatio.toFixed(4)),
+          mergedCount: publishRecords.length, chunksPlanned, failedChunks, coveragePercent
+        });
+        appendSchedulerLog({
+          event: 'HOUSE_SNAPSHOT_PARTIAL_MERGED', house: reader.houseName, houseId: reader.houseId,
+          previousCount, freshCurrentCount: currentCount, mergedCount: publishRecords.length, coveragePercent
+        });
+      } else if (currentCount > 0) {
+        this.lastGoodHouseRecords.set(reader.houseId, currentStateRecords);
+        writeConnectionDiagnostic({
+          event: 'HOUSE_SNAPSHOT_COMMITTED', house: reader.houseName, houseId: reader.houseId,
+          records: currentCount, chunksPlanned, failedChunks, coveragePercent
+        });
+      }
+
+      const result = await this.engine.ingest(publishRecords);
+      const pruned = await this.engine.replaceHouseStateByIdentity(reader.houseId, publishRecords);
+      const summary = this.summarizeNormalized(publishRecords);
+
+
+      // PATCH 113: concrete per-sport proof for the first five houses. This records
+      // what reached the normalized current-state layer, not cosmetic UI counters.
+      const auditHouses = new Set(['FULLTBET', 'BETFAIR', 'BETBRA']);
+      if (auditHouses.has(String(reader.houseName || '').trim().toUpperCase())) {
+        const sportAudit = new Map();
+        for (const rec of currentStateRecords) {
+          const sport = String(rec?.sport || 'UNKNOWN').trim() || 'UNKNOWN';
+          const row = sportAudit.get(sport) || { records: 0, events: new Set(), markets: new Set(), validOdds: 0 };
+          row.records += 1;
+          if (rec?.event?.id) row.events.add(String(rec.event.id));
+          if (rec?.market?.id) row.markets.add(String(rec.market.id));
+          if (Number(rec?.prices?.odd || 0) > 1) row.validOdds += 1;
+          sportAudit.set(sport, row);
+        }
+        writeConnectionDiagnostic({
+          event: 'SPORT_COVERAGE_PROOF', house: reader.houseName, houseId: reader.houseId, readerId: reader.id,
+          windowFrom: new Date(catalog.window.from).toISOString(), windowTo: new Date(catalog.window.to).toISOString(),
+          catalogEventsDiscovered: eventIdsDiscovered.length, catalogMarketsDiscovered: marketIdsDiscovered.length,
+          eventsProcessed: eventIdsProcessed.length, marketsProcessed: marketIdsProcessed.length,
+          sports: [...sportAudit.entries()].map(([sport, row]) => ({ sport, records: row.records, events: row.events.size, markets: row.markets.size, validOdds: row.validOdds }))
+            .sort((a, b) => b.events - a.events || a.sport.localeCompare(b.sport))
+        });
+
+        // PATCH 114: prova persistente completa da casa, por modalidade > competição > evento > mercado > seleção/odd.
+        // O arquivo é substituído a cada ciclo completo para representar o estado corrente, sem acumular lixo histórico.
+        try {
+          const hierarchy = {};
+          for (const rec of currentStateRecords) {
+            const sport = String(rec?.sport || 'UNKNOWN').trim() || 'UNKNOWN';
+            const competition = String(rec?.competition || rec?.event?.competition || 'UNKNOWN').trim() || 'UNKNOWN';
+            const eventId = String(rec?.event?.id || rec?.eventId || 'UNKNOWN');
+            const eventName = String(rec?.event?.name || rec?.eventName || 'UNKNOWN');
+            const marketId = String(rec?.market?.id || rec?.marketId || 'UNKNOWN');
+            const marketName = String(rec?.market?.name || rec?.market?.type || 'UNKNOWN');
+            hierarchy[sport] ||= {}; hierarchy[sport][competition] ||= {};
+            hierarchy[sport][competition][eventId] ||= { eventId, eventName, startTime: rec?.event?.startTime || null, markets: {} };
+            const evt = hierarchy[sport][competition][eventId];
+            evt.markets[marketId] ||= { marketId, marketName, marketType: rec?.market?.type || null, period: rec?.market?.period || null, selections: [] };
+            evt.markets[marketId].selections.push({
+              recordId: rec?.id || null, selectionId: rec?.selection?.id || rec?.runner?.id || null,
+              selection: rec?.selection?.name || rec?.runner?.name || rec?.selection || null,
+              side: rec?.prices?.side || rec?.side || null, odd: Number(rec?.prices?.odd || rec?.odd || 0) || null,
+              back: rec?.prices?.back ?? null, lay: rec?.prices?.lay ?? null,
+              sourceTimestamp: rec?.timestamps?.sourceTimestamp || rec?.timestamp || null
+            });
+          }
+          const safeHouse = String(reader.houseName || reader.houseId || 'UNKNOWN').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+          const auditPath = path.join(CRASH_LOG_ROOT, `${PATCH_TAG}_AUDIT_${safeHouse}.json`);
+          fs.writeJsonSync(auditPath, {
+            patch: PATCH_TAG, generatedAt: new Date().toISOString(), house: reader.houseName, houseId: reader.houseId, readerId: reader.id,
+            window: { from: new Date(catalog.window.from).toISOString(), to: new Date(catalog.window.to).toISOString() },
+            totals: { catalogEventsDiscovered: eventIdsDiscovered.length, catalogMarketsDiscovered: marketIdsDiscovered.length, eventsProcessed: eventIdsProcessed.length, marketsProcessed: marketIdsProcessed.length, records: currentStateRecords.length },
+            hierarchy
+          }, { spaces: 2 });
+          writeConnectionDiagnostic({ event: 'HOUSE_FULL_AUDIT_WRITTEN', house: reader.houseName, file: auditPath, records: currentStateRecords.length, events: eventIdsProcessed.length, markets: marketIdsProcessed.length });
+        } catch (auditError) {
+          writeConnectionDiagnostic({ event: 'HOUSE_FULL_AUDIT_FAILED', house: reader.houseName, error: String(auditError?.message || auditError) });
+        }
+      }
+
+
+      state.status = (executionPlan.length && endpointErrors.length === executionPlan.length) ? 'degraded' : 'connected';
+      state.cycles += 1;
+      state.records += result.accepted;
+      state.odds = summary.odds;
+      state.events = summary.events;
+      state.markets = summary.markets;
+      state.activeEndpoints = dedupeBy(activeEndpoints, (url) => String(url));
+      state.lastLatencyMs = latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0;
+      state.averageLatencyMs = Math.round(((state.averageLatencyMs || 0) * (state.cycles - 1) + state.lastLatencyMs) / state.cycles);
+      state.lastCycleMs = Date.now() - started;
+      state.averageCycleMs = Math.round(((state.averageCycleMs || 0) * (state.cycles - 1) + state.lastCycleMs) / state.cycles);
+      state.lastCaptureAt = new Date().toISOString();
+      state.lastSuccessAt = state.lastCaptureAt;
+      state.lastError = null;
+      state.heartbeatAt = state.lastCaptureAt;
+      state.heartbeatHealthy = true;
+      const freshOdds = Number(summary.odds || 0);
+      if (Number(result.accepted || 0) > 0 && freshOdds > 0) {
+        const previousFreshTs = parseIso(state.lastFreshAt);
+        state.lastFreshAt = state.lastCaptureAt;
+        state.freshOdds = freshOdds;
+        if (Number.isFinite(previousFreshTs)) {
+          const delta = Date.parse(state.lastFreshAt) - previousFreshTs;
+          if (delta > 0) {
+            const freshCycles = Number(state.freshCycles || 0) + 1;
+            state.freshCycles = freshCycles;
+            state.averageFreshIntervalMs = state.averageFreshIntervalMs
+              ? Math.round(((state.averageFreshIntervalMs * (freshCycles - 1)) + delta) / freshCycles)
+              : delta;
+          }
+        }
+      }
+      // PATCH 77: the full catalog is already persisted by EngineDataService. Keeping a
+      // second complete snapshot in every reader state multiplied memory by house count.
+      // Runtime/UI state keeps only compact counters and coverage evidence.
+      state.lastCatalog = {
+        generatedAt: (catalogUpdate.snapshot || catalogSnapshot).generatedAt || new Date().toISOString(),
+        counts: { ...(catalogUpdate.snapshot || catalogSnapshot).counts },
+        persisted: Boolean(catalogUpdate.updated),
+        pruneRemoved: Number(pruned.removed || 0),
+        executionPlanChunks: executionPlan.length,
+        executionPlanMarketIds: planMarketIds.length,
+        endpointErrors: endpointErrors.length,
+        coverage: {
+          catalogEventsDiscovered: eventIdsDiscovered.length,
+          uniqueEventIdsDiscovered: eventIdsDiscovered.length,
+          uniqueMarketIdsDiscovered: marketIdsDiscovered.length,
+          eventIdsPlanned: eventIdsPlanned.length,
+          marketIdsPlanned: marketIdsPlanned.length,
+          eventIdsProcessed: eventIdsProcessed.length,
+          marketIdsProcessed: marketIdsProcessed.length,
+          chunksPlanned,
+          chunksProcessed,
+          failedChunks,
+          coveragePercent,
+        },
+      };
+
+      await this.engine.log('readers', 'reader.run.completed', {
+        readerId: reader.id,
+        accepted: result.accepted,
+        duplicates: result.duplicates,
+        endpointErrors: endpointErrors.length,
+        endpointsExecuted: executionPlan.length,
+        droppedCatalogRecords: droppedByCapability,
+        excludedCatalogOnlyRecords: Number(catalogRecords.length || 0),
+        capabilityBreakdown: summary.capabilities,
+        catalogCompleted: Boolean(catalog.completed),
+        catalogPaginated: Boolean(catalog.paginated),
+        dynamicMarketIds: (catalog.dynamicMarketIds || []).length,
+        executionPlanMarketIds: planMarketIds.length,
+        executionPlanChunks: executionPlan.length,
+        coverage: {
+          catalogEventsDiscovered: eventIdsDiscovered.length,
+          uniqueEventIdsDiscovered: eventIdsDiscovered.length,
+          uniqueMarketIdsDiscovered: marketIdsDiscovered.length,
+          eventIdsPlanned: eventIdsPlanned.length,
+          marketIdsPlanned: marketIdsPlanned.length,
+          eventIdsProcessed: eventIdsProcessed.length,
+          marketIdsProcessed: marketIdsProcessed.length,
+          chunksPlanned,
+          chunksProcessed,
+          failedChunks,
+          coveragePercent,
+        },
+        catalogPersisted: Boolean(catalogUpdate.updated),
+        catalogCounts: catalogSnapshot.counts,
+        prunedRecords: Number(pruned.removed || 0),
+        operationalWindowMs: catalog.window.windowMs,
+      });
+
+      if (PERF_TRACE_ENABLED) {
+        const slowest = endpointMetrics
+          .filter((item) => Number.isFinite(item.requestDurationMs))
+          .sort((a, b) => Number(b.requestDurationMs || 0) - Number(a.requestDurationMs || 0))[0] || null;
+        await this.engine.log('readers', 'reader.cycle.metrics', {
+          readerId: reader.id,
+          houseId: reader.houseId,
+          cycleStart,
+          cycleEnd: new Date().toISOString(),
+          cycleDurationMs: Date.now() - started,
+          queueWaitMs: Number(runOptions.queueWaitMs || 0),
+          backoffMs: Number(state.lastBackoffMs || reader.intervalMs || 0),
+          acceptedRecords: Number(result.accepted || 0),
+          freshOdds,
+          heartbeatPulseCount: Number(state.heartbeatPulseCount || 0),
+          endpointsExecuted: executionPlan.length,
+          slowestEndpoint: slowest?.endpoint || null,
+          slowestRequestDurationMs: Number(slowest?.requestDurationMs || 0),
+        });
+      }
+
+      await this.refreshCoverageMonitor({ readerId: reader.id, houseId: reader.houseId });
+
+      return {
+        accepted: result.accepted,
+        duplicates: result.duplicates,
+        version: result.version,
+        endpointErrors: endpointErrors.length,
+        endpointsExecuted: executionPlan.length,
+        droppedCatalogRecords: droppedByCapability,
+        excludedCatalogOnlyRecords: Number(catalogRecords.length || 0),
+        capabilityBreakdown: summary.capabilities,
+        catalogCompleted: Boolean(catalog.completed),
+        catalogPaginated: Boolean(catalog.paginated),
+        dynamicMarketIds: (catalog.dynamicMarketIds || []).length,
+        executionPlanMarketIds: planMarketIds.length,
+        executionPlanChunks: executionPlan.length,
+        coverage: {
+          catalogEventsDiscovered: eventIdsDiscovered.length,
+          uniqueEventIdsDiscovered: eventIdsDiscovered.length,
+          uniqueMarketIdsDiscovered: marketIdsDiscovered.length,
+          eventIdsPlanned: eventIdsPlanned.length,
+          marketIdsPlanned: marketIdsPlanned.length,
+          eventIdsProcessed: eventIdsProcessed.length,
+          marketIdsProcessed: marketIdsProcessed.length,
+          chunksPlanned,
+          chunksProcessed,
+          failedChunks,
+          coveragePercent,
+        },
+        catalogPersisted: Boolean(catalogUpdate.updated),
+        catalogCounts: catalogSnapshot.counts,
+        prunedRecords: Number(pruned.removed || 0),
+        operationalWindow: {
+          from: new Date(catalog.window.from).toISOString(),
+          to: new Date(catalog.window.to).toISOString(),
+          windowMs: catalog.window.windowMs,
+        },
+      };
+    } catch (error) {
+      state.status = 'error';
+      state.errors += 1;
+      state.reconnects += 1;
+      state.lastError = error.message;
+      state.lastCycleMs = Date.now() - started;
+      state.averageCycleMs = state.cycles
+        ? Math.round(((state.averageCycleMs || 0) * state.cycles + state.lastCycleMs) / (state.cycles + 1))
+        : state.lastCycleMs;
+      state.heartbeatAt = new Date().toISOString();
+      if (PERF_TRACE_ENABLED) {
+        await this.engine.log('readers', 'reader.cycle.metrics', {
+          readerId: reader.id,
+          houseId: reader.houseId,
+          cycleStart,
+          cycleEnd: new Date().toISOString(),
+          cycleDurationMs: Date.now() - started,
+          queueWaitMs: Number(runOptions.queueWaitMs || 0),
+          backoffMs: Number(state.lastBackoffMs || reader.intervalMs || 0),
+          acceptedRecords: 0,
+          freshOdds: 0,
+          heartbeatPulseCount: Number(state.heartbeatPulseCount || 0),
+          failed: true,
+          error: error.message,
+        });
+      }
+      await this.engine.log('errors', 'reader.run.failed', {
+        readerId: reader.id,
+        houseId: reader.houseId,
+        error: error.message,
+      });
+      await this.refreshCoverageMonitor({ readerId: reader.id, houseId: reader.houseId });
+      throw error;
+    } finally {
+      clearInterval(cyclePulse);
+    }
+  }
+
+  async status() {
+    const readers = await this.generator.list();
+    const engine = this.engine.snapshot({ limit: 1 });
+    engine.operationalMode = this.operationalMode;
+    delete engine.records;
+
+    const now = Date.now();
+    const runtimeReaders = readers.map((reader) => {
+      const runtime = this.states.get(reader.id) || {
+        status: reader.active ? 'waiting' : 'inactive',
+        reconnects: 0,
+        structuralChanges: 0,
+        endpointChanges: 0,
+        apiChanges: 0,
+        layoutChanges: 0,
+        errors: 0,
+        averageLatencyMs: 0,
+        averageCycleMs: 0,
+        activeEndpoints: [],
+        odds: 0,
+        events: 0,
+        markets: 0,
+        collectionRunning: false,
+        averageFreshIntervalMs: 0,
+        lastFreshAt: null,
+        freshOdds: 0,
+        firstSuccessfulRequestAt: null,
+        firstAcceptedRecordAt: null,
+        firstFreshAt: null,
+        heartbeatPulseCount: 0,
+        lastQueueWaitMs: 0,
+        lastBackoffMs: 0,
+        alerts: [],
+        lastCatalog: null,
+      };
+      if (runtime.heartbeatAt) {
+        const heartbeatAgeMs = now - new Date(runtime.heartbeatAt).getTime();
+        const limit = reader.heartbeatTimeoutMs || 30000;
+        const wasHealthy = runtime.heartbeatHealthy !== false;
+        // PATCH 85: waiting for/running inside the global heavy-cycle scheduler is
+        // a healthy lifecycle state. A stale network heartbeat while collectionRunning
+        // must never demote an otherwise live reader to OFFLINE.
+        const schedulerProtected = runtime.collectionRunning === true;
+        runtime.schedulerProtected = schedulerProtected;
+        runtime.heartbeatHealthy = schedulerProtected || heartbeatAgeMs <= limit;
+        if (schedulerProtected && heartbeatAgeMs > limit) {
+          runtime.schedulerState = 'WAITING_OR_COLLECTING';
+        } else if (runtime.schedulerState === 'WAITING_OR_COLLECTING') {
+          runtime.schedulerState = null;
+        }
+        if (wasHealthy && !runtime.heartbeatHealthy) {
+          writeHealthLog({
+            house: reader.houseName, readerId: reader.id,
+            event: 'UI_OFFLINE_TRIGGER', UI_OFFLINE_TRIGGER: 'HEARTBEAT_EXPIRED',
+            heartbeatAgeMs, limit, status: runtime.status, schedulerProtected,
+          });
+        }
+      }
+      return { ...reader, file: undefined, runtime };
+    });
+
+    const catalog = await this.engine.catalogSummary();
+    const runtimes = runtimeReaders.map((reader) => reader.runtime);
+
+    const usage = process.cpuUsage();
+    const at = process.hrtime.bigint();
+    const elapsedMicros = Number(at - this.cpuSample.at) / 1000;
+    const cpuMicros = (usage.user - this.cpuSample.usage.user) + (usage.system - this.cpuSample.usage.system);
+    const cpuPercent = elapsedMicros > 0
+      ? Math.max(0, Math.min(100 * os.cpus().length, Number(((cpuMicros / elapsedMicros) * 100).toFixed(2))))
+      : 0;
+    this.cpuSample = { usage, at };
+
+    const memory = process.memoryUsage();
+    const alerts = runtimes
+      .flatMap((item) => item.alerts || [])
+      .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+      .slice(0, 100);
+
+    return {
+      schema: 'fallah.pipeline-status/v3',
+      initialized: this.initialized,
+      readers: runtimeReaders,
+      diagnostics: {
+        activeReaders: runtimes.filter((item) => ['running', 'connected', 'reconnecting', 'starting', 'waiting'].includes(item.status)).length,
+        stoppedReaders: runtimes.filter((item) => ['inactive', 'stopped'].includes(item.status)).length,
+        reconnects: runtimes.reduce((sum, item) => sum + (item.reconnects || 0), 0),
+        structuralChanges: runtimes.reduce((sum, item) => sum + (item.structuralChanges || 0), 0),
+        endpointChanges: runtimes.reduce((sum, item) => sum + (item.endpointChanges || 0), 0),
+        apiChanges: runtimes.reduce((sum, item) => sum + (item.apiChanges || 0), 0),
+        layoutChanges: runtimes.reduce((sum, item) => sum + (item.layoutChanges || 0), 0),
+        errors: runtimes.reduce((sum, item) => sum + (item.errors || 0), 0),
+        averageLatencyMs: runtimes.length
+          ? Math.round(runtimes.reduce((sum, item) => sum + (item.averageLatencyMs || 0), 0) / runtimes.length)
+          : 0,
+        averageCycleMs: runtimes.length
+          ? Math.round(runtimes.reduce((sum, item) => sum + (item.averageCycleMs || 0), 0) / runtimes.length)
+          : 0,
+        lastCaptureAt: runtimes
+          .map((item) => item.lastCaptureAt)
+          .filter(Boolean)
+          .sort()
+          .slice(-1)[0] || null,
+        activeEndpoints: new Set(runtimes.flatMap((item) => item.activeEndpoints || [])).size,
+        events: catalog.events || 0,
+        markets: catalog.markets || 0,
+        selections: catalog.selections || 0,
+        cpuPercent,
+        memory: {
+          rssBytes: memory.rss,
+          heapUsedBytes: memory.heapUsed,
+          heapTotalBytes: memory.heapTotal,
+          externalBytes: memory.external,
+        },
+        alerts,
+      },
+      engine,
+      robot: this.engine.robotStatus(),
+    };
+  }
+
+  async shutdown() {
+    for (const id of [...this.runners.keys()]) this.stopReader(id);
+    await Promise.allSettled([this.engine.queue, this.engine.catalogQueue].filter(Boolean));
+  }
+}
+
+const arbitrageDataPipelineService = new ArbitrageDataPipelineService();
+module.exports = { ArbitrageDataPipelineService, LiveCycleScheduler, arbitrageDataPipelineService, mergeCurrentStateRecords, looksNonSportsEndpoint };

@@ -1,0 +1,380 @@
+const fs = require('fs-extra');
+const path = require('path');
+
+function resolveWorkspacePath(options = {}) {
+  const explicit = options?.workspace || process.env.FALLAH_AGENT_WORKSPACE || process.env.FALLAH_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT;
+  if (explicit) return path.resolve(explicit);
+
+  const candidates = [];
+  const appDataRoot = process.env.LOCALAPPDATA || process.env.APPDATA;
+  if (appDataRoot) {
+    candidates.push(path.join(appDataRoot, 'Programs', 'FALLAH AGENT', 'resources', 'app', 'workspace'));
+    candidates.push(path.join(appDataRoot, 'Programs', 'FALLAH AGENT', 'resources', 'app'));
+  }
+  candidates.push(path.resolve(__dirname, '..', '..', '..', 'workspace'));
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return path.resolve(candidate);
+  }
+  return path.resolve(candidates[candidates.length - 1] || path.resolve(__dirname, '..', '..', '..', 'workspace'));
+}
+
+function normalizeKey(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function readTs(record = {}) {
+  const ts = Date.parse(String(record?.lastUpdatedAt || record?.normalizedAt || record?.timestamp || ''));
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function eventTs(record = {}) {
+  const ts = Date.parse(String(record?.event?.startTime || record?.market?.startTime || ''));
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function isPositive(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+function buildBuckets(now, ts) {
+  if (!Number.isFinite(ts)) return 'unknown';
+  const d = ts - now;
+  if (d < 0) return 'today';
+  const h = d / 3600000;
+  if (h <= 24) return 'next24h';
+  if (h <= 48) return 'h24to48';
+  if (h <= 72) return 'h48to72';
+  return 'above72h';
+}
+
+class CoverageAuditService {
+  constructor(options = {}) {
+    const workspace = resolveWorkspacePath(options);
+    this.workspace = workspace;
+    this.coverageFile = path.join(workspace, 'arbitrage-pipeline', 'coverage-monitor-current.json');
+    this.engineDataFile = path.join(workspace, 'arbitrage-pipeline', 'engine-data.json');
+    this.readersRoot = path.join(workspace, 'readers', 'exchange');
+  }
+
+  async readJsonSafe(filePath, fallback) {
+    try {
+      return await fs.readJson(filePath);
+    } catch {
+      return fallback;
+    }
+  }
+
+  detectPagination(reader = {}) {
+    const endpoints = reader.endpoints || [];
+    const hint = /offset=|page=|per-page=|per_page=|limit=|cursor=|\bpage\b|\bper-page\b|\blimit\b/i;
+    const exists = endpoints.some((endpoint) => hint.test(String(endpoint.url || '')));
+    return {
+      exists,
+      endpointCount: endpoints.length,
+      pageSizeHint: null,
+      pagesKnown: null,
+    };
+  }
+
+  async readersByHouseId() {
+    const output = {};
+    if (!(await fs.pathExists(this.readersRoot))) return output;
+    const files = await fs.readdir(this.readersRoot);
+    for (const name of files) {
+      if (!name.endsWith('.reader.json')) continue;
+      const full = path.join(this.readersRoot, name);
+      const reader = await this.readJsonSafe(full, null);
+      if (!reader?.houseId) continue;
+      output[String(reader.houseId)] = reader;
+    }
+    return output;
+  }
+
+  classifyMatchingFailure(record = {}, houseCountByEventKey = new Map()) {
+    const eventName = String(record?.event?.name || '').trim();
+    const sport = normalizeKey(record?.sport || '');
+    const comp = normalizeKey(record?.competition || '');
+    const key = `${sport}|${comp}|${normalizeKey(eventName)}`;
+    const houses = houseCountByEventKey.get(key) || 0;
+    if (houses >= 2) return null;
+    if (!eventName) return 'EVENTO_INVALIDO';
+    if (!sport || sport === 'unknown') return 'ESPORTE_DIVERGENTE';
+    if (!comp || comp === 'unknown') return 'COMPETICAO_DIVERGENTE';
+    if (/\bvs\b| x | @ /i.test(eventName) === false) return 'PARTICIPANTE_DIVERGENTE';
+    return 'SEM_CANDIDATO_EM_OUTRA_CASA';
+  }
+
+  async build() {
+    const coverage = await this.readJsonSafe(this.coverageFile, { houses: {}, global: {} });
+    const engine = await this.readJsonSafe(this.engineDataFile, { records: {} });
+    const readersByHouse = await this.readersByHouseId();
+
+    const now = Date.now();
+    const housesMap = coverage.houses || {};
+    const records = Object.values(engine.records || {});
+
+    const recordsByHouse = {};
+    for (const record of records) {
+      const houseId = String(record?.houseId || '');
+      if (!houseId) continue;
+      if (!recordsByHouse[houseId]) recordsByHouse[houseId] = [];
+      recordsByHouse[houseId].push(record);
+    }
+
+    const eventHouseMap = new Map();
+    for (const [houseName, house] of Object.entries(housesMap)) {
+      const houseId = String(house?.houseId || '');
+      const hr = recordsByHouse[houseId] || [];
+      for (const record of hr) {
+        const key = `${normalizeKey(record?.sport)}|${normalizeKey(record?.competition)}|${normalizeKey(record?.event?.name || record?.event?.id)}`;
+        if (!eventHouseMap.has(key)) eventHouseMap.set(key, new Set());
+        eventHouseMap.get(key).add(houseName);
+      }
+    }
+    const eventHouseCount = new Map([...eventHouseMap.entries()].map(([k, v]) => [k, v.size]));
+
+    const byHouse = {};
+    const bySport = new Map();
+    const rejectGlobal = new Map();
+
+    let totalEventsReceived = 0;
+    let totalEventsValid = 0;
+    let totalMarkets = 0;
+    let totalSelections = 0;
+    let totalOddsBrutas = 0;
+    let totalOddsValidas = 0;
+
+    for (const [houseName, house] of Object.entries(housesMap)) {
+      const houseId = String(house?.houseId || '');
+      const hr = recordsByHouse[houseId] || [];
+      const freshness = house?.freshness || {};
+      const ttl = Math.max(1000, Number(freshness.ttlMs || 3600000));
+      const reader = readersByHouse[houseId] || {};
+      const pagination = this.detectPagination(reader);
+
+      const sourceEvents = Number(house?.funnel?.sourceEvents || 0);
+      const validEvents = Number(house?.operational?.operationalEventsLinkedToCatalog || house?.operational?.operationalEvents || 0);
+      const normalizedEvents = Number(house?.operational?.operationalEvents || 0);
+      const linkedEvents = Number(house?.operational?.operationalEventsLinkedToCatalog || 0);
+      const validMarkets = Number(house?.operational?.operationalMarkets || 0);
+      const selections = Number(house?.operational?.operationalRunners || 0);
+      const oddsBrutas = Number(house?.operational?.marketDataCapabilityRecords || house?.operational?.operationalRecords || 0);
+      const oddsValidas = Number(house?.operational?.recordsWithUsablePrice || 0);
+      const sourceIncomplete = Number(house?.operational?.sourceIncompleteRecords || 0);
+      const noLiquidity = Number(house?.operational?.unavailableByNoLiquidity || 0);
+      const suspendedUnavailable = Number(house?.operational?.unavailableBySuspension || 0);
+      const stale = Number(house?.operational?.staleRecords || 0);
+      const fresh = Number(house?.operational?.freshRecords || 0);
+
+      totalEventsReceived += sourceEvents;
+      totalEventsValid += validEvents;
+      totalMarkets += validMarkets;
+      totalSelections += selections;
+      totalOddsBrutas += oddsBrutas;
+      totalOddsValidas += oddsValidas;
+
+      let liveEvents = 0;
+      let prematchEvents = 0;
+      let unknownEvents = 0;
+      const bucket = { today: 0, next24h: 0, h24to48: 0, h48to72: 0, above72h: 0, unknown: 0 };
+      const eventSeen = new Set();
+      const sportRows = new Map();
+
+      const sourceEventsKnown = Number.isFinite(sourceEvents) && sourceEvents > 0;
+      const hasEventGap = sourceEventsKnown && linkedEvents > 0 && linkedEvents < sourceEvents;
+      const partialPagination = Boolean(pagination.exists && Number(house?.funnel?.latestRun?.catalogPaginated ? 0 : 1) && hasEventGap);
+
+      const localReject = new Map();
+      localReject.set('REJEITADO_SEM_ODD', sourceIncomplete);
+      localReject.set('REJEITADO_SOURCE_INCOMPLETE', sourceIncomplete);
+      localReject.set('ODD_INDISPONIVEL_SEM_LIQUIDEZ', noLiquidity);
+      localReject.set('ODD_INDISPONIVEL_SUSPENSA', suspendedUnavailable);
+      localReject.set('REJEITADO_STALE', stale);
+      localReject.set('REJEITADO_SEM_SELECAO', Number(house?.operational?.runnersUnknown || 0));
+      localReject.set('REJEITADO_ESPORTE', Number(house?.operational?.unknownSportAfter || 0));
+      localReject.set('REJEITADO_PAGINACAO', partialPagination ? 1 : 0);
+      localReject.set('REJEITADO_OUTRO', Number(house?.funnel?.latestRun?.endpointErrors || 0));
+
+      for (const [reason, value] of localReject.entries()) {
+        rejectGlobal.set(reason, (rejectGlobal.get(reason) || 0) + Number(value || 0));
+      }
+
+      for (const record of hr) {
+        const sport = String(record?.sport || 'UNKNOWN').trim() || 'UNKNOWN';
+        const sportKey = normalizeKey(sport) || 'unknown';
+        if (!sportRows.has(sportKey)) {
+          sportRows.set(sportKey, {
+            sport,
+            eventsReceived: 0,
+            eventsValid: 0,
+            markets: 0,
+            odds: 0,
+            freshEvents: 0,
+            live: 0,
+            prematch: 0,
+            unknownStatus: 0,
+          });
+        }
+        const row = sportRows.get(sportKey);
+
+        const eventId = String(record?.event?.id || `${record?.event?.name || ''}|${record?.competition || ''}`).trim();
+        const marketId = String(record?.market?.id || '').trim();
+        const isLive = Boolean(record?.inPlay) || String(record?.status || '').toLowerCase() === 'live';
+        const updTs = readTs(record);
+        const startTs = eventTs(record);
+
+        if (eventId && !eventSeen.has(`${sportKey}|${eventId}`)) {
+          eventSeen.add(`${sportKey}|${eventId}`);
+          row.eventsValid += 1;
+          if (isLive) {
+            liveEvents += 1;
+            row.live += 1;
+          } else if (Number.isFinite(startTs) && startTs >= now - 3600000) {
+            prematchEvents += 1;
+            row.prematch += 1;
+          } else {
+            unknownEvents += 1;
+            row.unknownStatus += 1;
+          }
+
+          const b = buildBuckets(now, startTs);
+          bucket[b] += 1;
+
+          if (Number.isFinite(updTs) && now - updTs <= ttl) row.freshEvents += 1;
+        }
+
+        if (marketId) row.markets += 1;
+        if (isPositive(record?.prices?.back) || isPositive(record?.prices?.lay) || isPositive(record?.prices?.odd)) row.odds += 1;
+      }
+
+      for (const [sportKey, row] of sportRows.entries()) {
+        if (!bySport.has(sportKey)) bySport.set(sportKey, { sport: row.sport, houses: {} });
+        bySport.get(sportKey).houses[houseName] = {
+          eventsReceived: Number(house?.catalog?.events || 0),
+          eventsValid: row.eventsValid,
+          markets: row.markets,
+          odds: row.odds,
+          freshEvents: row.freshEvents,
+          live: row.live,
+          prematch: row.prematch,
+          unknownStatus: row.unknownStatus,
+        };
+      }
+
+      let matchingNoCandidate = 0;
+      let matchingDivergent = 0;
+      for (const record of hr) {
+        const reason = this.classifyMatchingFailure(record, eventHouseCount);
+        if (!reason) continue;
+        if (reason === 'SEM_CANDIDATO_EM_OUTRA_CASA') matchingNoCandidate += 1;
+        else matchingDivergent += 1;
+      }
+
+      const eventsRejected = Math.max(0, sourceEvents - Number(house?.operational?.operationalEventsLinkedToCatalog || 0));
+
+      byHouse[houseName] = {
+        houseId,
+        readerActive: Boolean(house?.readerActive),
+        dadoFresco: stale === 0 && fresh > 0,
+        esportesEncontrados: Number((house?.modalities || []).filter((m) => Number(m.operationalEvents || 0) > 0).length),
+        eventosRecebidos: sourceEvents > 0 ? sourceEvents : 'TOTAL_DA_FONTE_NAO_DETERMINAVEL',
+        eventosValidos: validEvents,
+        eventosNormalizados: normalizedEvents,
+        eventosPersistidos: validEvents,
+        eventosRejeitados: eventsRejected,
+        mercados: validMarkets,
+        selecoes: selections,
+        oddsBrutas,
+        oddsValidas,
+        sourceIncomplete,
+        oddIndisponivelSemLiquidez: noLiquidity,
+        oddIndisponivelSuspensa: suspendedUnavailable,
+        backValidos: Number(house?.operational?.recordsWithBack || 0),
+        layValidos: Number(house?.operational?.recordsWithLay || 0),
+        live: liveEvents,
+        prematch: prematchEvents,
+        statusDesconhecido: unknownEvents,
+        janelaTemporal: bucket,
+        paginacao: {
+          existe: pagination.exists,
+          pageSize: pagination.pageSizeHint,
+          paginasDisponiveisConhecidas: pagination.pagesKnown,
+          paginasPercorridas: null,
+          registrosPrimeiraPagina: null,
+          registrosTotalColetado: oddsBrutas,
+          parouPor: house?.funnel?.lossStage || 'NONE',
+          coletaParcialDetectada: partialPagination,
+        },
+        principalMotivoRejeicao: [...localReject.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'REJEITADO_OUTRO',
+        matching: {
+          eventosNaoCruzadosSemCandidato: matchingNoCandidate,
+          eventosNaoCruzadosDivergencia: matchingDivergent,
+        },
+        funnel: house?.funnel || {},
+        freshness: house?.freshness || {},
+        health: house?.health || 'UNKNOWN',
+        sourcePolicy: house?.sourcePolicy || {},
+      };
+    }
+
+    const bySportRows = [...bySport.values()].sort((a, b) => String(a.sport).localeCompare(String(b.sport)));
+
+    const eventHouses = [...eventHouseMap.values()].map((set) => set.size);
+    const eventosCruzados2 = eventHouses.filter((n) => n >= 2).length;
+    const eventosCruzados3 = eventHouses.filter((n) => n >= 3).length;
+    const eventosCruzados4 = eventHouses.filter((n) => n >= 4).length;
+    const eventosCruzados5 = eventHouses.filter((n) => n >= 5).length;
+    const eventosCruzados6 = eventHouses.filter((n) => n >= 6).length;
+
+    const topReasons = [...rejectGlobal.entries()]
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    return {
+      schema: 'fallah.coverage-audit/v1',
+      generatedAt: new Date().toISOString(),
+      houses: byHouse,
+      totals: {
+        totalEsportes: bySportRows.length,
+        totalEventosRecebidos: totalEventsReceived,
+        totalEventosValidos: totalEventsValid,
+        totalMercados: totalMarkets,
+        totalSelecoes: totalSelections,
+        totalOdds: totalOddsValidas,
+        totalOddsBrutas,
+      },
+      crossing: {
+        eventosCruzados2Casas: eventosCruzados2,
+        eventosCruzados3Casas: eventosCruzados3,
+        eventosCruzados4Casas: eventosCruzados4,
+        eventosCruzados5Casas: eventosCruzados5,
+        eventosCruzados6Casas: eventosCruzados6,
+        mercadosCruzados: Number(coverage?.global?.totals?.operationalMarkets || 0),
+        combinacoesAnalisadasEstimadas: Number(coverage?.global?.potentialCommonality?.reduce((sum, row) => sum + Math.max(0, Number(row.commonMarkets || 0)), 0) || 0),
+      },
+      top10MotivosRejeicao: topReasons,
+      relatorioPorEsporte: bySportRows,
+      perdasProvaveis: {
+        porPaginacao: [...Object.values(byHouse)].filter((h) => h.paginacao.coletaParcialDetectada).length,
+        porLiquidez: 0,
+        porFiltroTemporal: 0,
+        porNormalizacao: [...Object.values(byHouse)].reduce((sum, h) => sum + Number(h.sourceIncomplete || 0), 0),
+        porMatching: [...Object.values(byHouse)].reduce((sum, h) => sum + Number(h.matching.eventosNaoCruzadosSemCandidato || 0), 0),
+        porMercados: 0,
+        porOdds: Math.max(0, [...Object.values(byHouse)].reduce((sum, h) => sum + Number(h.sourceIncomplete || 0), 0)),
+      },
+    };
+  }
+}
+
+const coverageAuditService = new CoverageAuditService();
+module.exports = { CoverageAuditService, coverageAuditService };

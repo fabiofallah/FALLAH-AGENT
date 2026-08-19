@@ -1,0 +1,48 @@
+const { app, BrowserWindow, nativeImage } = require('electron');
+const path = require('path');
+const http = require('http');
+
+const APP_PORT = Number(process.env.FALLAH_AGENT_PORT || 37621);
+const APP_URL = `http://127.0.0.1:${APP_PORT}`;
+process.env.PORT = String(APP_PORT);
+let mainWindow;
+
+function waitForServer(attempts = 80) {
+  return new Promise((resolve, reject) => {
+    const tryRequest = () => {
+      const request = http.get(`${APP_URL}/health`, (response) => { response.resume();if (response.statusCode === 200) resolve();else retry(); });
+      request.on('error', retry);request.setTimeout(500, () => request.destroy());
+    };
+    const retry = () => { if (--attempts <= 0) reject(new Error('O servidor local não iniciou.'));else setTimeout(tryRequest, 250); };
+    tryRequest();
+  });
+}
+
+function serverAvailable() {
+  return new Promise((resolve) => {
+    const request = http.get(`${APP_URL}/health`, (response) => { response.resume();resolve(response.statusCode === 200); });
+    request.on('error', () => resolve(false));request.setTimeout(500, () => { request.destroy();resolve(false); });
+  });
+}
+
+async function createWindow() {
+  process.env.FALLAH_FOUNDATION_DATA_ROOT = path.join(app.getPath('userData'), 'foundation');
+  process.env.FALLAH_PROJECT_ROOTS = process.env.FALLAH_PROJECT_ROOTS || path.parse(app.getPath('documents')).root;
+  if (!(await serverAvailable())) require('../server');
+  await waitForServer();
+  const iconPath = path.join(__dirname, '..', '..', 'build', 'fallah-agent.png');
+  mainWindow = new BrowserWindow({ width: 1480, height: 940, minWidth: 1100, minHeight: 720, title: 'FALLAH AGENT', icon: nativeImage.createFromPath(iconPath), autoHideMenuBar: true, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, url) => { if (!url.startsWith(APP_URL)) event.preventDefault(); });
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  await mainWindow.loadURL(APP_URL);mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+app.whenReady().then(async () => {
+  if (app.isPackaged && !process.env.PORTABLE_EXECUTABLE_FILE) {
+    app.setLoginItemSettings({ openAtLogin: false, path: process.execPath });
+  }
+  await createWindow();
+});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('activate', () => { if (!mainWindow) createWindow(); });

@@ -1,0 +1,1677 @@
+const crypto = require('crypto');
+const os = require('os');
+const fs = require('fs-extra');
+const path = require('path');
+const { ReaderGeneratorService } = require('./pipeline/readerGeneratorService');
+const { EngineDataService } = require('./pipeline/engineDataService');
+const { CoverageMonitorService } = require('./pipeline/coverageMonitorService');
+const { normalizePayload } = require('./pipeline/normalizerService');
+
+function structure(value, depth = 0) {
+  if (depth > 5) return 'truncated';
+  if (Array.isArray(value)) return ['array', value.length ? structure(value[0], depth + 1) : 'empty'];
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .slice(0, 100)
+        .map((key) => [key, structure(value[key], depth + 1)])
+    );
+  }
+  return value === null ? 'null' : typeof value;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeMethod(method) {
+  const value = String(method || 'GET').toUpperCase();
+  return ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(value) ? value : 'GET';
+}
+
+function sanitizeHeaders(headers = {}) {
+  const blocked = /cookie|authorization|token|secret|api[-_]?key/i;
+  const output = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (typeof value !== 'string') continue;
+    if (blocked.test(name)) continue;
+    output[name] = value;
+  }
+  return output;
+}
+
+function parseJsonSafe(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function cloneValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((item) => cloneValue(item));
+  return { ...value };
+}
+
+function toFiniteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseIso(value) {
+  const ts = Date.parse(String(value || ''));
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function updateSearchParam(urlText, name, value) {
+  try {
+    const url = new URL(String(urlText || ''));
+    if (value === null || value === undefined || value === '') url.searchParams.delete(name);
+    else url.searchParams.set(name, String(value));
+    return url.toString();
+  } catch {
+    return urlText;
+  }
+}
+
+function getSearchParam(urlText, name) {
+  try {
+    const url = new URL(String(urlText || ''));
+    return url.searchParams.get(name);
+  } catch {
+    return null;
+  }
+}
+
+function hasSearchParam(urlText, name) {
+  return getSearchParam(urlText, name) !== null;
+}
+
+function dedupeBy(items, keyOf) {
+  const seen = new Set();
+  const output = [];
+  for (const item of items || []) {
+    const key = keyOf(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+  return output;
+}
+
+function stableRecordId(parts) {
+  return crypto.createHash('sha256').update(parts.map((item) => String(item || '')).join('|')).digest('hex').slice(0, 24);
+}
+
+function normalizeBetfairExchangeRequestUrl(urlText = '') {
+  try {
+    const url = new URL(String(urlText || ''));
+    if (/ero\.betfair\.bet\.br/i.test(url.hostname) && /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(url.pathname)) {
+      const locale = String(url.searchParams.get('locale') || '').toLowerCase();
+      if (locale === 'pt_br') url.searchParams.set('locale', 'pt');
+    }
+    return url.toString();
+  } catch {
+    return urlText;
+  }
+}
+
+function extractEventTimes(payload, output = [], depth = 0) {
+  if (depth > 8 || output.length >= 100000) return output;
+  if (Array.isArray(payload)) {
+    for (const item of payload) extractEventTimes(item, output, depth + 1);
+    return output;
+  }
+  if (!payload || typeof payload !== 'object') return output;
+
+  const candidates = [
+    payload.start,
+    payload.startTime,
+    payload.openDate,
+    payload.marketTime,
+    payload.timestamp,
+    payload.updatedAt,
+    payload.updated_at,
+    payload.time,
+  ];
+  for (const value of candidates) {
+    const ts = parseIso(value);
+    if (ts !== null) output.push(ts);
+  }
+
+  for (const child of Object.values(payload)) {
+    if (child && typeof child === 'object') extractEventTimes(child, output, depth + 1);
+  }
+  return output;
+}
+
+function looksNonSportsEndpoint(urlText = '') {
+  const raw = String(urlText || '');
+  let target = raw;
+  try {
+    const parsed = new URL(raw);
+    target = `${parsed.hostname}${parsed.pathname}`;
+  } catch {
+    target = raw.split('?')[0];
+  }
+  return /translation|bundle\/translations|consent|onetrust|clarity|facebook|trafficguard|metadata|footer|header|siteconfigs|scripttemplates|analytics|tagmanager|gtm|cookie|casino|slots?|bingo|live-?casino/.test(target.toLowerCase());
+}
+
+function endpointHasStaticEntityIds(endpoint = {}) {
+  const url = String(endpoint.url || '');
+  const query = endpoint.queryParameters || {};
+  const candidates = [
+    getSearchParam(url, 'marketIds'),
+    getSearchParam(url, 'eventIds'),
+    getSearchParam(url, 'selectionIds'),
+    query.marketIds,
+    query.eventIds,
+    query.selectionIds,
+  ];
+  return candidates.some((value) => {
+    if (value === null || value === undefined) return false;
+    const text = String(value).trim();
+    if (!text) return false;
+    if (/\{\{|\$\{|<.+>/.test(text)) return false;
+    return /[,0-9a-f]/i.test(text);
+  });
+}
+
+function looksLikeCatalogEndpoint(endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  const score = Number(endpoint.utilityScore || 0);
+  const method = normalizeMethod(endpoint.method);
+  const structureText = JSON.stringify(endpoint.responseStructures || []).toLowerCase();
+  const queryText = JSON.stringify(endpoint.queryParameters || {}).toLowerCase();
+  const hasPagination = endpointHasPaginationHints(endpoint);
+  const hasStaticIds = endpointHasStaticEntityIds(endpoint);
+  if (score < 10) return false;
+  if (!['GET', 'POST'].includes(method)) return false;
+  if (looksNonSportsEndpoint(url)) return false;
+  if (/bundle\/images|svg|png|jpg|jpeg|css|js\b/.test(url)) return false;
+  if (hasStaticIds && !hasPagination && !/eventtypes|navigation|facet|competitions|events|fixtures/.test(url)) return false;
+  return (
+    /sports?|eventtypes?|competitions?|events?|fixtures?|markets?|inplay|navigation|facet/.test(url) ||
+    /sports?|competitions?|events?|fixtures?|markets?|eventnodes?|marketnodes?/.test(structureText) ||
+    /offset|cursor|page|before|after|eventtypes?|competitions?/.test(queryText)
+  );
+}
+
+function buildOperationalWindow(reader = {}, options = {}) {
+  const timezone = 'America/Sao_Paulo';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const year = Number(parts.find((item) => item.type === 'year')?.value || 0);
+  const month = Number(parts.find((item) => item.type === 'month')?.value || 0);
+  const day = Number(parts.find((item) => item.type === 'day')?.value || 0);
+
+  const timezoneOffsetMs = (timestamp) => {
+    const offsetParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).formatToParts(new Date(timestamp));
+    const localYear = Number(offsetParts.find((item) => item.type === 'year')?.value || 0);
+    const localMonth = Number(offsetParts.find((item) => item.type === 'month')?.value || 0);
+    const localDay = Number(offsetParts.find((item) => item.type === 'day')?.value || 0);
+    const localHour = Number(offsetParts.find((item) => item.type === 'hour')?.value || 0);
+    const localMinute = Number(offsetParts.find((item) => item.type === 'minute')?.value || 0);
+    const localSecond = Number(offsetParts.find((item) => item.type === 'second')?.value || 0);
+    const localAsUtc = Date.UTC(localYear, localMonth - 1, localDay, localHour, localMinute, localSecond);
+    return localAsUtc - timestamp;
+  };
+
+  const zonedMidnightToUtc = (y, m, d) => {
+    const utcGuess = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
+    const offset = timezoneOffsetMs(utcGuess);
+    return utcGuess - offset;
+  };
+
+  const from = zonedMidnightToUtc(year, month, day);
+  const to = zonedMidnightToUtc(year, month, day + 2) - 1;
+  return {
+    now: Date.now(),
+    from,
+    to,
+    windowMs: Math.max(0, to - from),
+    mode: 'today_tomorrow',
+    timezone,
+  };
+}
+
+function endpointHasPaginationHints(endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  const qp = endpoint.queryParameters || {};
+  const keys = new Set([
+    ...Object.keys(qp || {}).map((k) => String(k).toLowerCase()),
+  ]);
+  for (const name of ['offset', 'page', 'per-page', 'per_page', 'limit', 'before', 'after', 'cursor', 'next']) {
+    if (keys.has(name) || hasSearchParam(url, name)) return true;
+  }
+  return false;
+}
+
+function chunk(items, size) {
+  const output = [];
+  const step = Math.max(1, Number(size) || 1);
+  for (let index = 0; index < items.length; index += step) {
+    output.push(items.slice(index, index + step));
+  }
+  return output;
+}
+
+function parsePositiveLimit(value, fallback = Number.POSITIVE_INFINITY) {
+  if (value === null || value === undefined || value === '' || value === 'all' || value === 'ALL') return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function extractMarketIdsFromPayload(payload, output = new Set(), depth = 0) {
+  const maxDynamicMarketIds = parsePositiveLimit(process.env.FALLAH_MAX_DYNAMIC_MARKET_IDS, Number.POSITIVE_INFINITY);
+  if (depth > 8 || (Number.isFinite(maxDynamicMarketIds) && output.size >= maxDynamicMarketIds)) return output;
+  if (Array.isArray(payload)) {
+    for (const item of payload) extractMarketIdsFromPayload(item, output, depth + 1);
+    return output;
+  }
+  if (!payload || typeof payload !== 'object') return output;
+
+  const directIds = [
+    payload.marketId,
+    payload.market_id,
+    payload.id,
+  ];
+  for (const value of directIds) {
+    const text = String(value || '').trim();
+    if (!text) continue;
+    if (/^\d+(?:\.\d+)?$/.test(text) || /[a-f0-9]{16,}/i.test(text)) output.add(text);
+  }
+
+  if (Array.isArray(payload.markets)) {
+    for (const market of payload.markets) {
+      const value = String(market?.id || market?.marketId || market?.market_id || '').trim();
+      if (value) output.add(value);
+    }
+  } else if (payload.markets && typeof payload.markets === 'object') {
+    for (const [key, market] of Object.entries(payload.markets)) {
+      const value = String(market?.id || market?.marketId || market?.market_id || key || '').trim();
+      if (value) output.add(value);
+    }
+  }
+
+  if (payload.attachments?.markets && typeof payload.attachments.markets === 'object') {
+    for (const [key, market] of Object.entries(payload.attachments.markets)) {
+      const value = String(market?.marketId || market?.id || key || '').trim();
+      if (value) output.add(value);
+    }
+  }
+  if (Array.isArray(payload.marketNodes)) {
+    for (const node of payload.marketNodes) {
+      const value = String(node?.marketId || node?.id || node?.description?.marketId || '').trim();
+      if (value) output.add(value);
+    }
+  }
+  if (Array.isArray(payload.eventNodes)) {
+    for (const eventNode of payload.eventNodes) {
+      extractMarketIdsFromPayload(eventNode, output, depth + 1);
+    }
+  }
+  if (Array.isArray(payload.eventTypes)) {
+    for (const eventType of payload.eventTypes) {
+      extractMarketIdsFromPayload(eventType, output, depth + 1);
+    }
+  }
+  return output;
+}
+
+function upsertCatalogEntry(collection, id, value) {
+  const key = String(id || '').trim();
+  if (!key) return null;
+  const current = collection[key] || {};
+  const next = { ...current };
+  for (const [field, incoming] of Object.entries(value || {})) {
+    const currentValue = current[field];
+    const incomingText = typeof incoming === 'string' ? incoming.trim() : incoming;
+    const currentText = typeof currentValue === 'string' ? currentValue.trim() : currentValue;
+    const incomingMeaningful = incomingText !== null && incomingText !== undefined && incomingText !== '' && String(incomingText).toUpperCase() !== 'UNKNOWN';
+    const currentMeaningful = currentText !== null && currentText !== undefined && currentText !== '' && String(currentText).toUpperCase() !== 'UNKNOWN';
+    if (incomingMeaningful || !currentMeaningful) next[field] = incoming;
+  }
+  collection[key] = { ...next, id: key };
+  return collection[key];
+}
+
+function collectFacetCatalog(payload, snapshot) {
+  const eventTypes = payload?.attachments?.eventTypes || {};
+  const facets = payload?.facets?.[0]?.values || [];
+  for (const sportNode of facets) {
+    const sportId = String(sportNode?.key?.eventTypeId || '').trim();
+    if (!sportId) continue;
+    const sportName = eventTypes[sportId]?.name || 'UNKNOWN';
+    upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+    for (const competitionNode of sportNode?.next?.values || []) {
+      const competitionId = String(competitionNode?.key?.competitionId || '').trim();
+      if (!competitionId) continue;
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionNode?.key?.competitionName || null });
+      for (const eventNode of competitionNode?.next?.values || []) {
+        const eventId = String(eventNode?.key?.eventId || '').trim();
+        if (!eventId) continue;
+        upsertCatalogEntry(snapshot.events, eventId, { sportId, competitionId, name: eventNode?.key?.eventName || null });
+        for (const marketNode of eventNode?.next?.values || []) {
+          const marketId = String(marketNode?.key?.marketId || '').trim();
+          if (!marketId) continue;
+          upsertCatalogEntry(snapshot.markets, marketId, { sportId, competitionId, eventId, name: marketNode?.key?.marketName || null });
+        }
+      }
+    }
+  }
+}
+
+function collectStructuredCatalog(payload, snapshot) {
+  if (Array.isArray(payload?.eventTypes)) {
+    for (const eventType of payload.eventTypes) {
+      const sportId = String(eventType?.id || eventType?.eventTypeId || eventType?.eventType?.id || '').trim() || `sport:${String(eventType?.name || eventType?.eventType?.name || 'UNKNOWN').trim()}`;
+      const sportName = String(eventType?.name || eventType?.eventType?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+      upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+      for (const eventNode of eventType?.eventNodes || []) {
+        const event = eventNode?.event || {};
+        const competitionId = String(event?.competition?.id || eventNode?.competitionId || event?.competitionId || '').trim() || `competition:${sportId}:${String(event?.competitionName || event?.competition?.name || 'UNKNOWN').trim()}`;
+        const competitionName = String(event?.competitionName || event?.competition?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+        upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+        const eventId = String(eventNode?.eventId || event?.id || '').trim();
+        if (!eventId) continue;
+        upsertCatalogEntry(snapshot.events, eventId, { sportId, competitionId, name: event?.name || null, startTime: event?.openDate || event?.startTime || null, status: event?.inPlayBettingStatus || null });
+        for (const marketNode of eventNode?.marketNodes || []) {
+          const market = marketNode?.description || {};
+          const marketId = String(marketNode?.marketId || market?.marketId || marketNode?.id || '').trim();
+          if (!marketId) continue;
+          upsertCatalogEntry(snapshot.markets, marketId, { sportId, competitionId, eventId, name: market?.marketName || marketNode?.marketName || null, type: market?.marketType || null });
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(payload?.events)) {
+    for (const event of payload.events) {
+      const sportName = String((event['meta-tags'] || []).find((item) => item?.type === 'SPORT')?.name || event.sportName || 'UNKNOWN').trim() || 'UNKNOWN';
+      const sportId = `sport:${sportName}`;
+      upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+      const competitionName = String((event['meta-tags'] || []).find((item) => item?.type === 'COMPETITION')?.name || event.competitionName || 'UNKNOWN').trim() || 'UNKNOWN';
+      const competitionId = `competition:${sportId}:${competitionName}`;
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+      const eventId = String(event.id || event.eventId || '').trim();
+      if (!eventId) continue;
+      upsertCatalogEntry(snapshot.events, eventId, { sportId, competitionId, name: event.name || event.eventName || null, startTime: event.start || event.startTime || null, status: event.status || null });
+      for (const market of event.markets || []) {
+        const marketId = String(market.id || market.marketId || '').trim();
+        if (!marketId) continue;
+        upsertCatalogEntry(snapshot.markets, marketId, { sportId, competitionId, eventId, name: market.name || market.marketName || null, type: market['market-type'] || market.type || null });
+      }
+    }
+  }
+
+  if (Array.isArray(payload?.leagues)) {
+    const payloadSportId = String(payload?.sportId || '').trim();
+    const sportId = payloadSportId || 'sport:UNKNOWN';
+    const sportName = payloadSportId ? `SPORT_${payloadSportId}` : 'UNKNOWN';
+    upsertCatalogEntry(snapshot.sports, sportId, { name: sportName, houseId: snapshot.houseId });
+
+    for (const league of payload.leagues) {
+      const competitionId = String(league?.id || '').trim() || `competition:${sportId}:${String(league?.name || 'UNKNOWN').trim()}`;
+      const competitionName = String(league?.name || 'UNKNOWN').trim() || 'UNKNOWN';
+      upsertCatalogEntry(snapshot.competitions, competitionId, { sportId, name: competitionName });
+
+      for (const event of league?.events || []) {
+        const eventId = String(event?.id || '').trim();
+        if (!eventId) continue;
+        const participantNames = Array.isArray(event?.participants)
+          ? event.participants.map((item) => String(item?.name || item?.englishName || '').trim()).filter(Boolean)
+          : [];
+        const eventName = participantNames.length >= 2 ? `${participantNames[0]} vs ${participantNames[1]}` : null;
+        const eventStartTime = Number.isFinite(Number(event?.time)) ? new Date(Number(event.time)).toISOString() : null;
+        upsertCatalogEntry(snapshot.events, eventId, {
+          sportId,
+          competitionId,
+          name: eventName,
+          startTime: eventStartTime,
+          status: event?.live ? 'live' : 'active',
+        });
+
+        const periods = Array.isArray(event?.periods) ? event.periods : Object.values(event?.periods || {});
+        for (const period of periods) {
+          const moneyLineId = String(period?.moneyLine?.lineId || '').trim();
+          if (moneyLineId) {
+            upsertCatalogEntry(snapshot.markets, moneyLineId, { sportId, competitionId, eventId, name: 'Money Line', type: 'MATCH_ODDS' });
+          }
+
+          const handicapLines = Array.isArray(period?.handicap) ? period.handicap : Object.values(period?.handicap || {});
+          for (const line of handicapLines) {
+            const marketId = String(line?.lineId || '').trim();
+            if (!marketId) continue;
+            upsertCatalogEntry(snapshot.markets, marketId, {
+              sportId,
+              competitionId,
+              eventId,
+              name: `Handicap ${line?.homeSpread ?? ''}`.trim(),
+              type: 'ASIAN_HANDICAP',
+            });
+          }
+
+          const overUnderLines = Array.isArray(period?.overUnder) ? period.overUnder : Object.values(period?.overUnder || {});
+          for (const line of overUnderLines) {
+            const marketId = String(line?.lineId || '').trim();
+            if (!marketId) continue;
+            upsertCatalogEntry(snapshot.markets, marketId, {
+              sportId,
+              competitionId,
+              eventId,
+              name: `Over/Under ${line?.points ?? ''}`.trim(),
+              type: 'OVER_UNDER',
+            });
+          }
+        }
+      }
+    }
+  }
+}
+
+function buildCatalogSnapshot(reader, catalog) {
+  const snapshot = {
+    schema: 'fallah.current-catalog/v1',
+    houseId: reader.houseId,
+    houseName: reader.houseName,
+    sourceType: reader.houseType || 'other',
+    generatedAt: new Date().toISOString(),
+    windowFrom: new Date(catalog.window.from).toISOString(),
+    windowTo: new Date(catalog.window.to).toISOString(),
+    endpointSummaries: catalog.endpointSummaries || [],
+    sports: {},
+    competitions: {},
+    events: {},
+    markets: {},
+    activeMarketIds: [],
+    valid: false,
+  };
+
+  for (const item of catalog.payloads || []) {
+    const payload = filterPayloadByWindow(item.payload, catalog.window);
+    collectFacetCatalog(payload, snapshot);
+    collectStructuredCatalog(payload, snapshot);
+  }
+
+  return finalizeCatalogSnapshot(snapshot);
+}
+
+function finalizeCatalogSnapshot(snapshot) {
+  snapshot.activeMarketIds = [...new Set(Object.keys(snapshot.markets || {}).map((item) => String(item)).filter(Boolean))];
+  snapshot.counts = {
+    sports: Object.keys(snapshot.sports || {}).length,
+    competitions: Object.keys(snapshot.competitions || {}).length,
+    events: Object.keys(snapshot.events || {}).length,
+    markets: Object.keys(snapshot.markets || {}).length,
+  };
+  snapshot.valid = Boolean(
+    snapshot.counts.events > 0 &&
+    snapshot.counts.markets > 0 &&
+    snapshot.activeMarketIds.length > 0 &&
+    (snapshot.endpointSummaries || []).some((entry) => entry.completed)
+  );
+  return snapshot;
+}
+
+function mergeCatalogPayloadsIntoSnapshot(snapshot, payloads = []) {
+  const window = {
+    from: Date.parse(String(snapshot.windowFrom || '')),
+    to: Date.parse(String(snapshot.windowTo || '')),
+  };
+  for (const payload of payloads || []) {
+    const filteredPayload = Number.isFinite(window.from) && Number.isFinite(window.to)
+      ? filterPayloadByWindow(payload, window)
+      : payload;
+    collectFacetCatalog(filteredPayload, snapshot);
+    collectStructuredCatalog(filteredPayload, snapshot);
+  }
+
+  return finalizeCatalogSnapshot(snapshot);
+}
+
+function buildCatalogCurrentStateRecords(snapshot = {}) {
+  const records = [];
+  for (const market of Object.values(snapshot.markets || {})) {
+    const eventId = String(market?.eventId || '').trim();
+    const marketId = String(market?.id || '').trim();
+    if (!eventId || !marketId) continue;
+    const event = snapshot.events?.[eventId] || {};
+    const competition = snapshot.competitions?.[market.competitionId] || {};
+    const sport = snapshot.sports?.[market.sportId] || {};
+    records.push({
+      schema: 'fallah.normalized/v2',
+      id: stableRecordId([snapshot.houseId, eventId, marketId, 'catalog']),
+      houseId: snapshot.houseId,
+      readerId: null,
+      sourceProvider: snapshot.houseName || null,
+      sourceEndpoint: 'catalog-snapshot',
+      sport: sport.name || 'UNKNOWN',
+      sportId: market.sportId || null,
+      competition: competition.name || 'UNKNOWN',
+      competitionId: market.competitionId || null,
+      event: {
+        id: eventId,
+        name: event.name || 'UNKNOWN',
+        startTime: event.startTime || null,
+        sourceTimezone: null,
+      },
+      market: {
+        id: marketId,
+        name: market.name || 'IDENTIFIED_MARKET',
+        type: market.type || 'IDENTIFIED_MARKET',
+        status: event.status || null,
+        startTime: event.startTime || null,
+      },
+      runner: {
+        id: '',
+        name: '',
+        selectionId: '',
+        handicap: null,
+        status: null,
+      },
+      prices: {
+        back: null,
+        lay: null,
+        odd: null,
+        liquidity: null,
+        volume: null,
+        bestBack: { price: null, size: null },
+        bestLay: { price: null, size: null },
+        availableToBack: [],
+        availableToLay: [],
+      },
+      timestamps: {
+        sourceTimestamp: snapshot.generatedAt || null,
+        collectedAt: snapshot.generatedAt || new Date().toISOString(),
+        updatedAt: snapshot.generatedAt || new Date().toISOString(),
+      },
+      timestamp: snapshot.generatedAt || new Date().toISOString(),
+      status: event.status || 'active',
+      inPlay: false,
+      collectedAt: snapshot.generatedAt || new Date().toISOString(),
+      updatedAt: snapshot.generatedAt || new Date().toISOString(),
+      normalizedAt: snapshot.generatedAt || new Date().toISOString(),
+    });
+  }
+  return records;
+}
+
+function executionPriority(reader = {}, endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  let score = Number(endpoint.utilityScore || 0);
+  const types = (() => {
+    try {
+      return String(new URL(endpoint.url).searchParams.get('types') || '').toUpperCase();
+    } catch {
+      return '';
+    }
+  })();
+  if (String(reader.houseType || '').toLowerCase() === 'exchange') {
+    if (/\/exchange\//.test(url)) score += 40;
+    if (/fixedodds/.test(url)) score -= 80;
+    if (/\/bymarket/.test(url)) score += 80;
+    if (/RUNNER_EXCHANGE_PRICES_BEST|MARKET_RATES|RUNNER_DESCRIPTION|RUNNER_STATE|EVENT/.test(types)) score += 120;
+    if (types === 'MARKET_STATE') score -= 20;
+    if (/inplayservice/.test(url)) score -= 10;
+  }
+  return score;
+}
+
+function isRichExchangeMarketEndpoint(endpoint = {}) {
+  const url = String(endpoint.url || '').toLowerCase();
+  if (!/\/bymarket/.test(url)) return false;
+  try {
+    const types = String(new URL(endpoint.url).searchParams.get('types') || '').toUpperCase();
+    return /RUNNER_EXCHANGE_PRICES_BEST|MARKET_RATES|RUNNER_DESCRIPTION|RUNNER_STATE|EVENT/.test(types);
+  } catch {
+    return false;
+  }
+}
+
+function filterPayloadByWindow(payload, window) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (Array.isArray(payload?.events)) {
+    const filtered = payload.events.filter((event) => {
+      const ts =
+        parseIso(event?.start) ??
+        parseIso(event?.startTime) ??
+        parseIso(event?.openDate) ??
+        parseIso(event?.timestamp);
+      if (ts === null) return true;
+      return ts >= window.from && ts <= window.to;
+    });
+    return { ...payload, events: filtered };
+  }
+  if (Array.isArray(payload?.eventTypes)) {
+    const eventTypes = payload.eventTypes
+      .map((eventType) => {
+        const eventNodes = (eventType?.eventNodes || []).filter((eventNode) => {
+          const event = eventNode?.event || {};
+          const ts = parseIso(event.openDate) ?? parseIso(event.startTime) ?? parseIso(eventNode?.startTime);
+          if (ts === null) return true;
+          return ts >= window.from && ts <= window.to;
+        });
+        return { ...eventType, eventNodes };
+      })
+      .filter((eventType) => (eventType.eventNodes || []).length > 0);
+    return { ...payload, eventTypes };
+  }
+  if (Array.isArray(payload?.leagues)) {
+    const leagues = payload.leagues
+      .map((league) => {
+        const events = (league?.events || []).filter((event) => {
+          const ts = Number.isFinite(Number(event?.time)) ? Number(event.time) : null;
+          if (ts === null) return true;
+          return ts >= window.from && ts <= window.to;
+        });
+        return { ...league, events };
+      })
+      .filter((league) => (league.events || []).length > 0);
+    return { ...payload, leagues };
+  }
+  return payload;
+}
+
+function hasRemainingByPagination(pageData = {}) {
+  if (Number.isFinite(pageData.total) && Number.isFinite(pageData.offset) && Number.isFinite(pageData.limit)) {
+    return pageData.offset + pageData.limit < pageData.total;
+  }
+  if (Number.isFinite(pageData.itemsCount) && Number.isFinite(pageData.limit)) {
+    return pageData.itemsCount >= pageData.limit;
+  }
+  return false;
+}
+
+function extractPaginationMeta(payload, endpointUrl) {
+  const total = toFiniteNumber(payload?.total);
+  const offset = toFiniteNumber(payload?.offset ?? getSearchParam(endpointUrl, 'offset'));
+  const limit = toFiniteNumber(
+    payload?.perPage ??
+      payload?.per_page ??
+      payload?.limit ??
+      getSearchParam(endpointUrl, 'per-page') ??
+      getSearchParam(endpointUrl, 'per_page') ??
+      getSearchParam(endpointUrl, 'limit')
+  );
+  const eventsCount = Array.isArray(payload?.events) ? payload.events.length : null;
+  return {
+    total,
+    offset,
+    limit,
+    itemsCount: Number.isFinite(eventsCount) ? eventsCount : null,
+    hasNextCursor: Boolean(payload?.next || payload?.nextCursor || payload?.cursor?.next),
+    nextCursor: payload?.next || payload?.nextCursor || payload?.cursor?.next || null,
+  };
+}
+
+function resolveBody(endpoint, method) {
+  if (['GET', 'HEAD'].includes(method)) return undefined;
+  if (endpoint.body === null || endpoint.body === undefined) return undefined;
+  if (typeof endpoint.body === 'string') return endpoint.body;
+  return JSON.stringify(endpoint.body);
+}
+
+function hasOperationalPrices(record = {}) {
+  const back = Number(record?.prices?.back);
+  const lay = Number(record?.prices?.lay);
+  return (Number.isFinite(back) && back > 0) || (Number.isFinite(lay) && lay > 0);
+}
+
+function hasRealRunnerIdentity(record = {}) {
+  const name = String(record?.runner?.name || '').trim().toUpperCase();
+  return Boolean(name) && name !== 'UNKNOWN';
+}
+
+function recordCompletenessScore(record = {}) {
+  let score = 0;
+  if (record?.event?.id) score += 1;
+  if (record?.market?.id) score += 1;
+  if (record?.runner?.id) score += 1;
+  if (hasRealRunnerIdentity(record)) score += 2;
+  if (hasOperationalPrices(record)) score += 3;
+  return score;
+}
+
+function recordIdentityKey(record = {}) {
+  const runnerIdentity = String(
+    record.runner?.id ||
+    record.runner?.selectionId ||
+    record.runner?.name ||
+    ''
+  ).trim().toUpperCase();
+  return [
+    String(record.houseId || ''),
+    String(record.event?.id || ''),
+    String(record.market?.id || ''),
+    runnerIdentity,
+  ].join('|');
+}
+
+function classifyRecordCapability(record = {}) {
+  const hasCoreIdentity = Boolean(record?.event?.id && record?.market?.id);
+  if (!hasCoreIdentity) return 'UNKNOWN_CAPABILITY';
+  if (hasRealRunnerIdentity(record) && hasOperationalPrices(record)) return 'MARKET_DATA_CAPABILITY';
+  return 'CATALOG_CAPABILITY';
+}
+
+function selectMoreCompleteRecord(current, incoming) {
+  if (!current) return incoming;
+  const currentScore = recordCompletenessScore(current);
+  const incomingScore = recordCompletenessScore(incoming);
+  if (incomingScore > currentScore) return incoming;
+  if (incomingScore < currentScore) return current;
+
+  const currentTs = Date.parse(current?.lastUpdatedAt || current?.normalizedAt || current?.timestamp || '');
+  const incomingTs = Date.parse(incoming?.lastUpdatedAt || incoming?.normalizedAt || incoming?.timestamp || '');
+  if (Number.isFinite(incomingTs) && Number.isFinite(currentTs) && incomingTs > currentTs) return incoming;
+  if (Number.isFinite(incomingTs) && !Number.isFinite(currentTs)) return incoming;
+  return current;
+}
+
+function mergeCurrentStateRecords(records = []) {
+  const byIdentity = new Map();
+  for (const record of records || []) {
+    const key = recordIdentityKey(record);
+    if (!key || key === '|||') continue;
+    const existing = byIdentity.get(key);
+    byIdentity.set(key, selectMoreCompleteRecord(existing, record));
+  }
+
+  return [...byIdentity.values()];
+}
+
+class ArbitrageDataPipelineService {
+  constructor(options = {}) {
+    this.generator = new ReaderGeneratorService(options);
+    this.engine = new EngineDataService(options);
+    this.coverageMonitor = new CoverageMonitorService(options);
+    this.runners = new Map();
+    this.states = new Map();
+    this.initialized = false;
+    this.cpuSample = { usage: process.cpuUsage(), at: process.hrtime.bigint() };
+  }
+
+  async refreshCoverageMonitor(context = {}) {
+    try {
+      const result = await this.coverageMonitor.updateCurrentState();
+      if (!result.updated) {
+        await this.engine.log('errors', 'coverage-monitor.update.failed', {
+          readerId: context.readerId || null,
+          houseId: context.houseId || null,
+          reason: result.error || 'UNKNOWN',
+          preserved: Boolean(result.preserved),
+        });
+      }
+      return result;
+    } catch (error) {
+      await this.engine.log('errors', 'coverage-monitor.update.exception', {
+        readerId: context.readerId || null,
+        houseId: context.houseId || null,
+        reason: error.message,
+      });
+      return { updated: false, error: error.message, preserved: true };
+    }
+  }
+
+  async initialize({ start = true } = {}) {
+    if (!this.initialized) {
+      await this.engine.initialize();
+      this.initialized = true;
+    }
+    await this.ensureHouseProfiles();
+    const readers = await this.generator.generateAll();
+    if (start) {
+      for (const reader of readers) if (reader.active) this.startReader(reader);
+    }
+    return this.status();
+  }
+
+  async ensureHouseProfiles() {
+    let discovery = null;
+    try {
+      ({ discoveryEngineService: discovery } = require('./discoveryEngineService'));
+    } catch {
+      return;
+    }
+    if (!discovery || typeof discovery.listHouses !== 'function') return;
+
+    const houses = await discovery.listHouses().catch(() => []);
+    if (!Array.isArray(houses) || !houses.length) return;
+
+    const tasks = houses
+      .filter((house) => house?.active && !house?.blocked)
+      .map((house) => this.ensureHouseProfile(discovery, house));
+    await Promise.allSettled(tasks);
+  }
+
+  async ensureHouseProfile(discovery, house) {
+    const profileFile = String(house?.profileFile || '').trim();
+    const profileRoot = this.generator.profilesRoot;
+    const profilePath = profileFile ? path.resolve(profileRoot, profileFile) : null;
+
+    let profileValid = false;
+    if (profilePath) {
+      try {
+        if (profilePath.startsWith(`${profileRoot}${path.sep}`) && (await fs.pathExists(profilePath))) {
+          const profile = await fs.readJson(profilePath);
+          profileValid = ['fallah.discovery.profile/v1', 'fallah.discovery.profile/v2'].includes(profile?.profileSchema)
+            && Array.isArray(profile?.network?.endpoints)
+            && profile.network.endpoints.length > 0;
+        }
+      } catch {
+        profileValid = false;
+      }
+    }
+
+    if (profileValid) return;
+
+    await this.engine.log('readers', 'reader.profile.missing-or-invalid', {
+      houseId: house.id,
+      houseName: house.name,
+      profileFile: profileFile || null,
+    });
+
+    if (typeof discovery.runDiscovery !== 'function') return;
+    try {
+      let task = discovery.running?.get?.(house.id);
+      if (!task) {
+        await discovery.runDiscovery(house.id, { observationMs: 10000 });
+        task = discovery.running?.get?.(house.id) || null;
+      }
+      if (task && typeof task.then === 'function') {
+        await Promise.race([
+          task,
+          new Promise((resolve) => setTimeout(resolve, 120000)),
+        ]);
+      }
+    } catch (error) {
+      await this.engine.log('errors', 'reader.profile.discovery.failed', {
+        houseId: house.id,
+        houseName: house.name,
+        reason: error.message,
+      });
+    }
+  }
+
+  async regenerate() {
+    await this.engine.log('readers', 'reader-generator.started');
+    const readers = await this.generator.generateAll();
+    for (const reader of readers) {
+      const runner = this.runners.get(reader.id);
+      if (runner && runner.sourceFingerprint !== reader.sourceFingerprint) this.stopReader(reader.id);
+      if (reader.active) this.startReader(reader);
+      else this.stopReader(reader.id);
+    }
+    await this.engine.log('readers', 'reader-generator.completed', { readers: readers.length });
+    return readers;
+  }
+
+  startReader(reader) {
+    if (this.runners.has(reader.id) || reader.blocked) return;
+    const runner = { stopped: false, timer: null, sourceFingerprint: reader.sourceFingerprint };
+    this.runners.set(reader.id, runner);
+    this.states.set(reader.id, {
+      readerId: reader.id,
+      houseId: reader.houseId,
+      status: 'starting',
+      retries: 0,
+      reconnects: 0,
+      errors: 0,
+      cycles: 0,
+      records: 0,
+      odds: 0,
+      events: 0,
+      markets: 0,
+      activeEndpoints: [],
+      averageLatencyMs: 0,
+      averageCycleMs: 0,
+      lastLatencyMs: 0,
+      lastCycleMs: 0,
+      heartbeatAt: new Date().toISOString(),
+      heartbeatHealthy: true,
+      lastRunAt: null,
+      lastSuccessAt: null,
+      lastCaptureAt: null,
+      lastError: null,
+      structuralChanges: 0,
+      endpointChanges: reader.changeDetection?.endpoint ? 1 : 0,
+      apiChanges: reader.changeDetection?.api ? 1 : 0,
+      layoutChanges: reader.changeDetection?.layout ? 1 : 0,
+      alerts: [],
+      lastCatalog: null,
+    });
+
+    const cycle = async () => {
+      if (runner.stopped) return;
+      await this.runReader(reader).catch(() => null);
+      if (!runner.stopped) {
+        runner.timer = setTimeout(cycle, reader.intervalMs);
+        runner.timer.unref?.();
+      }
+    };
+    cycle();
+  }
+
+  stopReader(id) {
+    const runner = this.runners.get(id);
+    if (runner) {
+      runner.stopped = true;
+      if (runner.timer) clearTimeout(runner.timer);
+      this.runners.delete(id);
+    }
+    const state = this.states.get(id);
+    if (state) state.status = 'inactive';
+  }
+
+  async setReaderActive(id, active) {
+    const reader = await this.generator.setActive(id, active);
+    if (active) this.startReader({ ...reader, id });
+    else this.stopReader(id);
+    return reader;
+  }
+
+  async removeHouse(houseId) {
+    await this.engine.initialize();
+    const removed = await this.generator.removeByHouse(houseId);
+    for (const id of removed) {
+      this.stopReader(id);
+      this.states.delete(id);
+    }
+    await this.engine.removeHouseData(houseId);
+    await this.engine.log('readers', 'readers.removed-with-house', { houseId, readers: removed.length });
+    return removed;
+  }
+
+  buildFetchRequest(endpoint, reader) {
+    const method = normalizeMethod(endpoint.method);
+    const headers = {
+      Accept: 'application/json',
+      'User-Agent': 'FALLAH-Agent-Reader/2.0',
+      ...sanitizeHeaders(endpoint.headers),
+    };
+    const body = resolveBody(endpoint, method);
+    if (body !== undefined && !Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/json';
+    }
+    return {
+      method,
+      headers,
+      body,
+      timeoutMs: reader.timeoutMs,
+      url: normalizeBetfairExchangeRequestUrl(endpoint.url),
+    };
+  }
+
+  async fetchRaw({ url, method, headers, body, timeoutMs }) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const started = Date.now();
+    try {
+      const response = await fetch(url, {
+        method,
+        headers,
+        body,
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentType = response.headers.get('content-type') || '';
+      if (!/json/i.test(contentType)) {
+        return {
+          payload: null,
+          latencyMs: Date.now() - started,
+          contentType,
+        };
+      }
+      const payload = await response.json();
+      return {
+        payload,
+        latencyMs: Date.now() - started,
+        contentType,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async fetchEndpoint(reader, endpoint, state) {
+    let lastError;
+    for (let attempt = 0; attempt <= reader.maxRetries; attempt += 1) {
+      try {
+        const request = this.buildFetchRequest(endpoint, reader);
+        const response = await this.fetchRaw(request);
+        if (response.payload === null) {
+          return { records: [], latencyMs: response.latencyMs, payload: null };
+        }
+
+        const schemaHash = crypto
+          .createHash('sha256')
+          .update(JSON.stringify(structure(response.payload)))
+          .digest('hex');
+        const key = `${reader.id}:${request.method}:${endpoint.url}`;
+        if (state.schemas?.[key] && state.schemas[key] !== schemaHash) {
+          state.structuralChanges += 1;
+          const alert = {
+            type: 'structural-change',
+            endpoint: endpoint.url,
+            method: request.method,
+            timestamp: new Date().toISOString(),
+          };
+          state.alerts = [...(state.alerts || []).slice(-99), alert];
+          await this.engine.log('readers', 'reader.structure.changed', {
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            method: request.method,
+          });
+        }
+        state.schemas = state.schemas || {};
+        state.schemas[key] = schemaHash;
+
+        return {
+          records: normalizePayload(response.payload, {
+            houseId: reader.houseId,
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            houseName: reader.houseName,
+          }),
+          latencyMs: response.latencyMs,
+          payload: response.payload,
+        };
+      } catch (error) {
+        lastError = error;
+        state.retries += 1;
+        const message = String(error.message || '');
+        const hardClientError = /^HTTP 4\d\d\b/.test(message) || /\b4\d\d\b/.test(message);
+
+        if (hardClientError && /HTTP 400/.test(message) && /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(String(endpoint?.url || ''))) {
+          const marketIdsParam = getSearchParam(endpoint.url, 'marketIds');
+          const ids = String(marketIdsParam || '')
+            .split(',')
+            .map((id) => String(id || '').trim())
+            .filter(Boolean);
+          if (ids.length > 1) {
+            const midpoint = Math.ceil(ids.length / 2);
+            const groups = [ids.slice(0, midpoint), ids.slice(midpoint)].filter((group) => group.length > 0);
+            const merged = { records: [], latencyMs: 0, payload: null };
+            for (const group of groups) {
+              const childEndpoint = this.buildDynamicEndpointFromCatalog(endpoint, { marketIds: group });
+              const childReader = { ...reader, maxRetries: 0 };
+              const child = await this.fetchEndpoint(childReader, childEndpoint, state);
+              merged.records.push(...(child.records || []));
+              merged.latencyMs += Number(child.latencyMs || 0);
+            }
+            return merged;
+          }
+        }
+
+        if (hardClientError) break;
+        if (attempt < reader.maxRetries) await wait(reader.reconnectDelayMs * (attempt + 1));
+      }
+    }
+    throw lastError;
+  }
+
+  getCatalogCandidates(reader = {}) {
+    const endpoints = (reader.endpoints || []).filter((endpoint) => looksLikeCatalogEndpoint(endpoint));
+    return endpoints.sort((left, right) => Number(right.utilityScore || 0) - Number(left.utilityScore || 0));
+  }
+
+  buildDynamicEndpointFromCatalog(baseEndpoint = {}, options = {}) {
+    const endpoint = {
+      ...baseEndpoint,
+      headers: { ...(baseEndpoint.headers || {}) },
+      queryParameters: { ...(baseEndpoint.queryParameters || {}) },
+      marketIds: [...(baseEndpoint.marketIds || [])],
+      body: cloneValue(baseEndpoint.body),
+    };
+
+    const window = options.window;
+    if (window) {
+      const beforeSeconds = Math.floor(window.to / 1000);
+      if (hasSearchParam(endpoint.url, 'before') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'before')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'before', beforeSeconds);
+      }
+      if (hasSearchParam(endpoint.url, 'after') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'after')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'after', Math.floor(window.from / 1000));
+      }
+    }
+
+    if (options.offset !== undefined && options.offset !== null) {
+      if (hasSearchParam(endpoint.url, 'offset') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'offset')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'offset', options.offset);
+      }
+      if (hasSearchParam(endpoint.url, 'page') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'page')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'page', options.offset);
+      }
+    }
+
+    if (options.limit !== undefined && options.limit !== null) {
+      if (hasSearchParam(endpoint.url, 'per-page') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'per-page')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'per-page', options.limit);
+      }
+      if (hasSearchParam(endpoint.url, 'per_page') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'per_page')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'per_page', options.limit);
+      }
+      if (hasSearchParam(endpoint.url, 'limit') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'limit')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'limit', options.limit);
+      }
+      if (hasSearchParam(endpoint.url, 'markets-limit') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'markets-limit')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'markets-limit', options.limit);
+      }
+    }
+
+    if (options.nextCursor) {
+      if (hasSearchParam(endpoint.url, 'cursor') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'cursor')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'cursor', options.nextCursor);
+      }
+      if (hasSearchParam(endpoint.url, 'next') || Object.prototype.hasOwnProperty.call(endpoint.queryParameters || {}, 'next')) {
+        endpoint.url = updateSearchParam(endpoint.url, 'next', options.nextCursor);
+      }
+    }
+
+    if (Array.isArray(options.marketIds) && options.marketIds.length) {
+      const ids = options.marketIds.map((id) => String(id));
+      endpoint.marketIds = ids;
+      if (hasSearchParam(endpoint.url, 'marketIds') || /marketIds=/i.test(endpoint.url)) {
+        endpoint.url = updateSearchParam(endpoint.url, 'marketIds', ids.join(','));
+      }
+      if (Array.isArray(endpoint.body)) endpoint.body = ids;
+      else if (endpoint.body && typeof endpoint.body === 'object') {
+        if (Array.isArray(endpoint.body.marketIds)) endpoint.body = { ...endpoint.body, marketIds: ids };
+        if (Array.isArray(endpoint.body.markets)) endpoint.body = { ...endpoint.body, markets: ids };
+      }
+    }
+
+    return endpoint;
+  }
+
+  async enumerateCatalog(reader, state, runOptions = {}) {
+    const window = buildOperationalWindow(reader, runOptions);
+    const candidates = this.getCatalogCandidates(reader);
+    const maxCatalogEndpoints = parsePositiveLimit(
+      runOptions.maxCatalogEndpoints ?? process.env.FALLAH_MAX_CATALOG_ENDPOINTS,
+      Number.POSITIVE_INFINITY
+    );
+    const maxCatalogPages = parsePositiveLimit(
+      runOptions.maxCatalogPages ?? process.env.FALLAH_MAX_CATALOG_PAGES,
+      Number.POSITIVE_INFINITY
+    );
+    const defaultPageSize = Math.max(20, Math.min(500, Number(runOptions.pageSize || 100)));
+
+    const selectedCandidates = Number.isFinite(maxCatalogEndpoints) ? candidates.slice(0, maxCatalogEndpoints) : [...candidates];
+    const payloads = [];
+    const endpointSummaries = [];
+
+    for (const base of selectedCandidates) {
+      let offset = 0;
+      let cursor = null;
+      let pages = 0;
+      let continuePagination = true;
+      let fetchedAtLeastOnePage = false;
+      let failed = false;
+      let failureReason = null;
+      const seenPageSignatures = new Set();
+
+      while (continuePagination && (!Number.isFinite(maxCatalogPages) || pages < maxCatalogPages)) {
+        const endpoint = this.buildDynamicEndpointFromCatalog(base, {
+          window,
+          offset,
+          limit: defaultPageSize,
+          nextCursor: cursor,
+        });
+
+        let capture;
+        try {
+          capture = await this.fetchEndpoint(reader, endpoint, state);
+        } catch (error) {
+          failed = true;
+          failureReason = error.message;
+          await this.engine.log('readers', 'reader.catalog.endpoint.failed', {
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            error: error.message,
+          });
+          break;
+        }
+        fetchedAtLeastOnePage = true;
+        pages += 1;
+        payloads.push({ endpoint, payload: capture.payload });
+
+        const payloadFiltered = filterPayloadByWindow(capture.payload, window);
+        if (payloadFiltered && payloadFiltered !== capture.payload) {
+          payloads[payloads.length - 1].payload = payloadFiltered;
+        }
+
+        // Break pagination when provider keeps returning the same page despite offset/cursor changes.
+        const pageSignature = crypto
+          .createHash('sha256')
+          .update(JSON.stringify(payloads[payloads.length - 1].payload || {}))
+          .digest('hex');
+        if (seenPageSignatures.has(pageSignature)) {
+          await this.engine.log('readers', 'reader.catalog.pagination.stalled', {
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            pages,
+          });
+          break;
+        }
+        seenPageSignatures.add(pageSignature);
+
+        const pageMeta = extractPaginationMeta(payloads[payloads.length - 1].payload || {}, endpoint.url);
+        if (pageMeta.hasNextCursor && pageMeta.nextCursor && pageMeta.nextCursor !== cursor) {
+          cursor = pageMeta.nextCursor;
+          continue;
+        }
+
+        if (hasRemainingByPagination(pageMeta)) {
+          offset += Number.isFinite(pageMeta.limit) && pageMeta.limit > 0 ? pageMeta.limit : defaultPageSize;
+          continue;
+        }
+
+        if (endpointHasPaginationHints(endpoint)) {
+          if (Number.isFinite(pageMeta.itemsCount) && Number.isFinite(pageMeta.limit) && pageMeta.itemsCount >= pageMeta.limit) {
+            offset += pageMeta.limit;
+            continue;
+          }
+        }
+
+        continuePagination = false;
+      }
+
+      endpointSummaries.push({
+        endpoint: base.url,
+        pages,
+        completed: fetchedAtLeastOnePage,
+        failed,
+        failureReason,
+      });
+    }
+
+    const marketIdSet = new Set();
+    for (const item of payloads) {
+      extractMarketIdsFromPayload(item.payload, marketIdSet);
+    }
+
+    const dynamicMarketIds = [...marketIdSet];
+    state.lastCatalog = {
+      windowFrom: new Date(window.from).toISOString(),
+      windowTo: new Date(window.to).toISOString(),
+      endpointCount: endpointSummaries.length,
+      endpointSummaries,
+      marketIds: dynamicMarketIds.length,
+      completed: endpointSummaries.some((entry) => entry.completed),
+      paginated: endpointSummaries.some((entry) => entry.pages > 1),
+    };
+
+    return {
+      window,
+      payloads,
+      dynamicMarketIds,
+      endpointSummaries,
+      completed: state.lastCatalog.completed,
+      paginated: state.lastCatalog.paginated,
+    };
+  }
+
+  buildExecutionPlan(reader, catalog, runOptions = {}) {
+    let dynamicIds = catalog.dynamicMarketIds || [];
+    const endpoints = [];
+    const exchangeReader = String(reader.houseType || '').toLowerCase() === 'exchange';
+    const richExchangeAvailable = exchangeReader && (reader.endpoints || []).some((endpoint) => isRichExchangeMarketEndpoint(endpoint));
+    const betfairExchangeOnly = String(reader.houseName || '').toUpperCase() === 'BETFAIR';
+    const fulltbetExchangeReader = String(reader.houseName || '').toUpperCase() === 'FULLTBET';
+    let betfairRichTemplateConsumed = false;
+
+    // Keep dynamic IDs for BETFAIR so the cycle reflects the current operational window,
+    // instead of stale fixed marketIds embedded in reader endpoint URLs.
+
+    if (fulltbetExchangeReader) {
+      const marketSnapshot = { sports: {}, competitions: {}, events: {}, markets: {} };
+      for (const item of catalog.payloads || []) {
+        collectFacetCatalog(item.payload, marketSnapshot);
+        collectStructuredCatalog(item.payload, marketSnapshot);
+      }
+      const marketIds = Object.keys(marketSnapshot.markets || {});
+      if (marketIds.length) dynamicIds = marketIds;
+    }
+
+    for (const endpoint of reader.endpoints || []) {
+      const url = String(endpoint.url || '').toLowerCase();
+      if (looksNonSportsEndpoint(url)) continue;
+      if (Number(endpoint.utilityScore || 0) < 8) continue;
+      if (betfairExchangeOnly && exchangeReader && !/\/sports\/exchange\/|\/inplayservice\//i.test(url)) continue;
+      if (exchangeReader && richExchangeAvailable && !isRichExchangeMarketEndpoint(endpoint)) continue;
+      const hasMarketIds = /marketids=/.test(url) || hasSearchParam(endpoint.url, 'marketIds') || Array.isArray(endpoint.marketIds) || Array.isArray(endpoint.body);
+      if (hasMarketIds && dynamicIds.length) {
+        const isBetfairByMarket = betfairExchangeOnly && /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(url);
+        if (isBetfairByMarket && betfairRichTemplateConsumed) continue;
+        const marketIdChunkSize = /\/sports\/exchange\/readonly\/v1\/bymarket/i.test(url)
+          ? (betfairExchangeOnly ? 20 : 10)
+          : 50;
+        for (const group of chunk(dynamicIds, marketIdChunkSize)) {
+          endpoints.push(this.buildDynamicEndpointFromCatalog(endpoint, { marketIds: group, window: catalog.window }));
+        }
+        if (isBetfairByMarket) betfairRichTemplateConsumed = true;
+        continue;
+      }
+      endpoints.push(this.buildDynamicEndpointFromCatalog(endpoint, { window: catalog.window }));
+    }
+
+    const deduped = dedupeBy(endpoints, (endpoint) => {
+      const method = normalizeMethod(endpoint.method);
+      const body = resolveBody(endpoint, method) || '';
+      return `${method} ${endpoint.url} ${body}`;
+    });
+    deduped.sort((left, right) => executionPriority(reader, right) - executionPriority(reader, left));
+
+    const maxExecutionEndpoints = parsePositiveLimit(
+      runOptions.maxExecutionEndpoints ?? process.env.FALLAH_MAX_EXECUTION_ENDPOINTS,
+      Number.POSITIVE_INFINITY
+    );
+    return Number.isFinite(maxExecutionEndpoints) ? deduped.slice(0, maxExecutionEndpoints) : deduped;
+  }
+
+  summarizeNormalized(normalized) {
+    const eventSet = new Set();
+    const marketSet = new Set();
+    const capabilityCounters = {
+      MARKET_DATA_CAPABILITY: 0,
+      CATALOG_CAPABILITY: 0,
+      UNKNOWN_CAPABILITY: 0,
+    };
+    for (const item of normalized || []) {
+      if (item?.event?.id) eventSet.add(String(item.event.id));
+      if (item?.market?.id) marketSet.add(String(item.market.id));
+      const capability = classifyRecordCapability(item);
+      capabilityCounters[capability] = (capabilityCounters[capability] || 0) + 1;
+    }
+    return {
+      odds: normalized.length,
+      events: eventSet.size,
+      markets: marketSet.size,
+      capabilities: capabilityCounters,
+    };
+  }
+
+  async runReader(reader, runOptions = {}) {
+    const state = this.states.get(reader.id) || {
+      readerId: reader.id,
+      houseId: reader.houseId,
+      retries: 0,
+      reconnects: 0,
+      errors: 0,
+      cycles: 0,
+      records: 0,
+      odds: 0,
+      events: 0,
+      markets: 0,
+      activeEndpoints: [],
+      structuralChanges: 0,
+      endpointChanges: 0,
+      apiChanges: 0,
+      layoutChanges: 0,
+      alerts: [],
+      lastCatalog: null,
+    };
+    this.states.set(reader.id, state);
+
+    state.status = 'running';
+    state.lastRunAt = new Date().toISOString();
+    state.heartbeatAt = state.lastRunAt;
+
+    const started = Date.now();
+    try {
+      const catalog = await this.enumerateCatalog(reader, state, runOptions);
+      const catalogSnapshot = buildCatalogSnapshot(reader, catalog);
+      if ((!Array.isArray(catalog.dynamicMarketIds) || !catalog.dynamicMarketIds.length) && Array.isArray(catalogSnapshot.activeMarketIds) && catalogSnapshot.activeMarketIds.length) {
+        catalog.dynamicMarketIds = [...catalogSnapshot.activeMarketIds];
+      }
+      const executionPlan = this.buildExecutionPlan(reader, catalog, runOptions);
+
+      const latencies = [];
+      const endpointErrors = [];
+      const activeEndpoints = [];
+      const normalizedByIdentity = new Map();
+
+      for (const endpoint of executionPlan) {
+        try {
+          const capture = await this.fetchEndpoint(reader, endpoint, state);
+          activeEndpoints.push(endpoint.url);
+          latencies.push(capture.latencyMs);
+          for (const record of capture.records || []) {
+            const enriched = {
+              ...record,
+              origin: { readerId: reader.id, endpoint: endpoint.url },
+              latencyMs: capture.latencyMs,
+              quality: Math.max(0, Math.min(100, 100 - Math.round(capture.latencyMs / 50))),
+              lastUpdatedAt: new Date().toISOString(),
+            };
+            const key = recordIdentityKey(enriched);
+            const current = normalizedByIdentity.get(key);
+            normalizedByIdentity.set(key, selectMoreCompleteRecord(current, enriched));
+          }
+        } catch (error) {
+          endpointErrors.push(`${endpoint.url}: ${error.message}`);
+          await this.engine.log('readers', 'reader.endpoint.failover', {
+            readerId: reader.id,
+            endpoint: endpoint.url,
+            error: error.message,
+          });
+        }
+      }
+
+      if (executionPlan.length && endpointErrors.length === executionPlan.length) {
+        throw new Error(`Todos os endpoints falharam: ${endpointErrors.join(' | ')}`);
+      }
+
+      const catalogUpdate = await this.engine.updateCurrentCatalog(catalogSnapshot);
+
+      const catalogRecords = buildCatalogCurrentStateRecords(catalogUpdate.snapshot || catalogSnapshot);
+      const currentStateRecords = [...normalizedByIdentity.values()];
+      const marketDataRecords = currentStateRecords.filter((record) => classifyRecordCapability(record) === 'MARKET_DATA_CAPABILITY').length;
+      const droppedByCapability = Math.max(0, Number(catalogRecords.length || 0));
+
+      const result = await this.engine.ingest(currentStateRecords);
+      const pruned = await this.engine.replaceHouseStateByIdentity(reader.houseId, currentStateRecords);
+      const summary = this.summarizeNormalized(currentStateRecords);
+
+      state.status = 'connected';
+      state.cycles += 1;
+      state.records += result.accepted;
+      state.odds = summary.odds;
+      state.events = summary.events;
+      state.markets = summary.markets;
+      state.activeEndpoints = dedupeBy(activeEndpoints, (url) => String(url));
+      state.lastLatencyMs = latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0;
+      state.averageLatencyMs = Math.round(((state.averageLatencyMs || 0) * (state.cycles - 1) + state.lastLatencyMs) / state.cycles);
+      state.lastCycleMs = Date.now() - started;
+      state.averageCycleMs = Math.round(((state.averageCycleMs || 0) * (state.cycles - 1) + state.lastCycleMs) / state.cycles);
+      state.lastCaptureAt = new Date().toISOString();
+      state.lastSuccessAt = state.lastCaptureAt;
+      state.lastError = null;
+      state.heartbeatAt = state.lastCaptureAt;
+      state.heartbeatHealthy = true;
+      state.lastCatalog = {
+        ...state.lastCatalog,
+        ...(catalogUpdate.snapshot || catalogSnapshot),
+        persisted: Boolean(catalogUpdate.updated),
+        pruneRemoved: Number(pruned.removed || 0),
+      };
+
+      await this.engine.log('readers', 'reader.run.completed', {
+        readerId: reader.id,
+        accepted: result.accepted,
+        duplicates: result.duplicates,
+        endpointErrors: endpointErrors.length,
+        endpointsExecuted: executionPlan.length,
+        droppedCatalogRecords: droppedByCapability,
+        excludedCatalogOnlyRecords: Number(catalogRecords.length || 0),
+        capabilityBreakdown: summary.capabilities,
+        catalogCompleted: Boolean(catalog.completed),
+        catalogPaginated: Boolean(catalog.paginated),
+        dynamicMarketIds: (catalog.dynamicMarketIds || []).length,
+        catalogPersisted: Boolean(catalogUpdate.updated),
+        catalogCounts: catalogSnapshot.counts,
+        prunedRecords: Number(pruned.removed || 0),
+        operationalWindowMs: catalog.window.windowMs,
+      });
+
+      await this.refreshCoverageMonitor({ readerId: reader.id, houseId: reader.houseId });
+
+      return {
+        accepted: result.accepted,
+        duplicates: result.duplicates,
+        version: result.version,
+        endpointErrors: endpointErrors.length,
+        endpointsExecuted: executionPlan.length,
+        droppedCatalogRecords: droppedByCapability,
+        excludedCatalogOnlyRecords: Number(catalogRecords.length || 0),
+        capabilityBreakdown: summary.capabilities,
+        catalogCompleted: Boolean(catalog.completed),
+        catalogPaginated: Boolean(catalog.paginated),
+        dynamicMarketIds: (catalog.dynamicMarketIds || []).length,
+        catalogPersisted: Boolean(catalogUpdate.updated),
+        catalogCounts: catalogSnapshot.counts,
+        prunedRecords: Number(pruned.removed || 0),
+        operationalWindow: {
+          from: new Date(catalog.window.from).toISOString(),
+          to: new Date(catalog.window.to).toISOString(),
+          windowMs: catalog.window.windowMs,
+        },
+      };
+    } catch (error) {
+      state.status = 'error';
+      state.errors += 1;
+      state.reconnects += 1;
+      state.lastError = error.message;
+      state.lastCycleMs = Date.now() - started;
+      state.averageCycleMs = state.cycles
+        ? Math.round(((state.averageCycleMs || 0) * state.cycles + state.lastCycleMs) / (state.cycles + 1))
+        : state.lastCycleMs;
+      state.heartbeatAt = new Date().toISOString();
+      await this.engine.log('errors', 'reader.run.failed', {
+        readerId: reader.id,
+        houseId: reader.houseId,
+        error: error.message,
+      });
+      await this.refreshCoverageMonitor({ readerId: reader.id, houseId: reader.houseId });
+      throw error;
+    }
+  }
+
+  async status() {
+    const readers = await this.generator.list();
+    const engine = this.engine.snapshot({ limit: 1 });
+    delete engine.records;
+
+    const now = Date.now();
+    const runtimeReaders = readers.map((reader) => {
+      const runtime = this.states.get(reader.id) || {
+        status: reader.active ? 'waiting' : 'inactive',
+        reconnects: 0,
+        structuralChanges: 0,
+        endpointChanges: 0,
+        apiChanges: 0,
+        layoutChanges: 0,
+        errors: 0,
+        averageLatencyMs: 0,
+        averageCycleMs: 0,
+        activeEndpoints: [],
+        odds: 0,
+        events: 0,
+        markets: 0,
+        alerts: [],
+        lastCatalog: null,
+      };
+      if (runtime.heartbeatAt) {
+        runtime.heartbeatHealthy = now - new Date(runtime.heartbeatAt).getTime() <= (reader.heartbeatTimeoutMs || 30000);
+      }
+      return { ...reader, file: undefined, runtime };
+    });
+
+    const catalog = await this.engine.catalogSummary();
+    const runtimes = runtimeReaders.map((reader) => reader.runtime);
+
+    const usage = process.cpuUsage();
+    const at = process.hrtime.bigint();
+    const elapsedMicros = Number(at - this.cpuSample.at) / 1000;
+    const cpuMicros = (usage.user - this.cpuSample.usage.user) + (usage.system - this.cpuSample.usage.system);
+    const cpuPercent = elapsedMicros > 0
+      ? Math.max(0, Math.min(100 * os.cpus().length, Number(((cpuMicros / elapsedMicros) * 100).toFixed(2))))
+      : 0;
+    this.cpuSample = { usage, at };
+
+    const memory = process.memoryUsage();
+    const alerts = runtimes
+      .flatMap((item) => item.alerts || [])
+      .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+      .slice(0, 100);
+
+    return {
+      schema: 'fallah.pipeline-status/v3',
+      initialized: this.initialized,
+      readers: runtimeReaders,
+      diagnostics: {
+        activeReaders: runtimes.filter((item) => ['running', 'connected', 'reconnecting', 'starting', 'waiting'].includes(item.status)).length,
+        stoppedReaders: runtimes.filter((item) => ['inactive', 'stopped'].includes(item.status)).length,
+        reconnects: runtimes.reduce((sum, item) => sum + (item.reconnects || 0), 0),
+        structuralChanges: runtimes.reduce((sum, item) => sum + (item.structuralChanges || 0), 0),
+        endpointChanges: runtimes.reduce((sum, item) => sum + (item.endpointChanges || 0), 0),
+        apiChanges: runtimes.reduce((sum, item) => sum + (item.apiChanges || 0), 0),
+        layoutChanges: runtimes.reduce((sum, item) => sum + (item.layoutChanges || 0), 0),
+        errors: runtimes.reduce((sum, item) => sum + (item.errors || 0), 0),
+        averageLatencyMs: runtimes.length
+          ? Math.round(runtimes.reduce((sum, item) => sum + (item.averageLatencyMs || 0), 0) / runtimes.length)
+          : 0,
+        averageCycleMs: runtimes.length
+          ? Math.round(runtimes.reduce((sum, item) => sum + (item.averageCycleMs || 0), 0) / runtimes.length)
+          : 0,
+        lastCaptureAt: runtimes
+          .map((item) => item.lastCaptureAt)
+          .filter(Boolean)
+          .sort()
+          .slice(-1)[0] || null,
+        activeEndpoints: new Set(runtimes.flatMap((item) => item.activeEndpoints || [])).size,
+        events: catalog.events || 0,
+        markets: catalog.markets || 0,
+        selections: catalog.selections || 0,
+        cpuPercent,
+        memory: {
+          rssBytes: memory.rss,
+          heapUsedBytes: memory.heapUsed,
+          heapTotalBytes: memory.heapTotal,
+          externalBytes: memory.external,
+        },
+        alerts,
+      },
+      engine,
+      robot: this.engine.robotStatus(),
+    };
+  }
+
+  async shutdown() {
+    for (const id of [...this.runners.keys()]) this.stopReader(id);
+  }
+}
+
+const arbitrageDataPipelineService = new ArbitrageDataPipelineService();
+module.exports = { ArbitrageDataPipelineService, arbitrageDataPipelineService };

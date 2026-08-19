@@ -1,0 +1,1280 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FALLAH ENGINE</title>
+  <link rel="stylesheet" href="/vendor/remixicon/fonts/remixicon.css" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="fallah-engine.css" />
+
+<style id="patch-133-calc-visual">
+#fe-calc-modal .fe-calc-event-info strong{font-size:20px;line-height:1.25;color:#fff;text-transform:uppercase;letter-spacing:.2px}
+#fe-calc-modal .fe-calc-event-info{font-size:13px;line-height:1.65}
+#fe-calc-modal .fe-calc-leg-label,#fe-calc-modal .fe-calc-sum-label{color:var(--fe-accent)!important;font-weight:800;letter-spacing:.45px}
+#fe-calc-modal .fe-calc-leg-val{font-size:15px;font-weight:800}
+#fe-calc-modal .fe-calc-leg{padding:16px;gap:12px}
+#fe-calc-modal .fe-modal-close{cursor:pointer;position:relative;z-index:10}
+#fe-calc-modal .fe-modal-close{width:42px!important;height:42px!important;min-width:42px!important;display:flex!important;align-items:center!important;justify-content:center!important;font-size:24px!important;pointer-events:auto!important;}
+#fe-calc-modal .fe-modal-header{position:relative;z-index:20;}
+</style>
+</head>
+<body data-theme="escuro" id="fallah-body">
+  <!-- FALLAH ENGINE TOPBAR -->
+  <header class="fe-topbar" id="fe-topbar">
+    <div class="fe-topbar-left">
+      <button class="fe-menu-btn" id="fe-menu-btn" title="Menu"><i class="ri-menu-line"></i></button>
+      <div class="fe-logo">
+        <span class="fe-logo-fallah">FALLAH</span>
+        <span class="fe-logo-engine">ENGINE</span>
+      </div>
+      <div class="fe-logo-sub">Sistema Operacional Inteligente</div>
+    </div>
+    <div class="fe-topbar-center">
+      <div style="display:flex;gap:6px;align-items:center"><div class="fe-status-badge" id="fe-system-status"><span class="fe-status-dot" id="fe-status-dot"></span><span id="fe-status-label">Carregando...</span></div><button class="fe-pill-sm" id="fe-system-online">ONLINE</button><button class="fe-pill-sm" id="fe-system-offline">OFFLINE</button></div>
+    </div>
+    <div class="fe-topbar-right">
+      <div class="fe-clock">
+        <div id="fe-clock-time">--:--:--</div>
+        <div id="fe-clock-date"></div>
+      </div>
+      <button class="fe-icon-btn" id="fe-alerts-btn" title="Alertas"><i class="ri-notification-3-line"></i><span class="fe-badge" id="fe-alerts-badge" hidden>0</span><span>ALERTAS</span></button>
+      <button class="fe-icon-btn" id="fe-settings-btn" title="Configurações"><i class="ri-settings-3-line"></i><span>CONFIGURAÇÕES</span></button>
+      <button class="fe-icon-btn fe-legacy-toggle" id="fe-legacy-toggle" title="Ferramentas técnicas (modo avançado)"><i class="ri-tools-line"></i><span>AVANÇADO</span></button>
+    </div>
+  </header>
+
+  <!-- FALLAH ENGINE MAIN SHELL -->
+  <div class="fe-shell" id="fe-shell">
+
+    <!-- FALLAH ENGINE HOME -->
+    <section class="fe-page active" id="fe-home">
+      <div class="fe-home-layout">
+        <div class="fe-home-hero" style="grid-template-columns:auto minmax(260px,1fr) minmax(330px,420px);">
+          <img src="ROBO.png" alt="Robô Fallah" class="fe-robo-img" />
+          <div class="fe-home-hero-text">
+            <h1>BEM-VINDO AO<br><span>FALLAH ENGINE</span></h1>
+            <p>Inteligência, velocidade e precisão<br>para transformar oportunidades<br>em resultados consistentes.</p>
+          </div>
+
+          <div class="fe-system-overview">
+            <div class="fe-overview-title">VISÃO GERAL DO SISTEMA</div>
+            <div class="fe-overview-row"><i class="ri-time-line"></i><span>UPTIME DO SISTEMA</span><span id="fe-uptime" class="fe-ov-val">--:--:--</span><span class="fe-ov-tag online">Online</span></div>
+            <div class="fe-overview-row"><i class="ri-cpu-line"></i><span>ENGINES ATIVOS</span><span id="fe-engines-active" class="fe-ov-val">-</span><span class="fe-ov-tag online" id="fe-engines-tag">Operacionais</span></div>
+            <div class="fe-overview-row"><i class="ri-speed-line"></i><span>CICLOS CONCLUÍDOS / SEG</span><span id="fe-lps" class="fe-ov-val">-</span><span class="fe-ov-tag online">Readers</span></div>
+            <div class="fe-overview-row"><i class="ri-refresh-line"></i><span>IDADE MÉDIA DOS DADOS</span><span id="fe-avg-update" class="fe-ov-val">-</span><span class="fe-ov-tag online">Freshness</span></div>
+            <div class="fe-overview-row"><i class="ri-alert-line"></i><span>ALERTAS ATIVOS</span><span id="fe-active-alerts" class="fe-ov-val">0</span><span class="fe-ov-tag alert" id="fe-alerts-tag">Não lidos</span></div>
+          </div>
+        </div>
+
+        <div aria-hidden="true" style="height:3px;background:linear-gradient(90deg,transparent,#f59e0b,transparent);margin:-16px 0 20px;"></div>
+
+        <div class="fe-modules-grid">
+          <div class="fe-module-card fe-module-arb" data-module="arbitrage">
+            <div class="fe-module-icon"><i class="ri-funds-line"></i></div>
+            <div class="fe-module-name">ARBITRAGEM</div>
+            <div class="fe-module-desc">Oportunidades entre casas e exchanges</div>
+            <div class="fe-module-stat-label">OPORTUNIDADES ATIVAS</div>
+            <div class="fe-module-stat" id="fe-arb-count">0</div>
+            <button class="fe-btn-primary" data-nav="fe-arbitrage">ENTRAR <i class="ri-arrow-right-s-line"></i></button>
+          </div>
+          <div class="fe-module-card fe-houses-control-card" id="fe-houses-badge">
+            <div class="fe-houses-control-head">
+              <div><div class="fe-module-name">CENTRAL DAS CASAS</div><div class="fe-module-desc">Controle individual de coleta e cruzamento</div></div>
+              <div class="fe-houses-global-actions"><button id="fe-houses-on-all" type="button">LIGAR TODAS</button><button id="fe-houses-off-all" type="button">DESLIGAR TODAS</button></div>
+            </div>
+            <div class="fe-houses-control-summary">ONLINE <strong id="fe-houses-count">0</strong> · OFFLINE <strong id="fe-houses-offline-count">0</strong> · TOTAL <strong id="fe-houses-total">0</strong></div>
+            <div class="fe-houses-status-groups">
+              <section class="fe-house-status-group fe-house-status-online" aria-label="Casas online">
+                <div class="fe-house-status-title"><span>CASAS ONLINE</span><strong id="fe-houses-online-group-count">0</strong></div>
+                <div class="fe-houses-pills" id="fe-houses-pills-online"></div>
+              </section>
+              <section class="fe-house-status-group fe-house-status-offline" aria-label="Casas offline">
+                <div class="fe-house-status-title"><span>CASAS OFFLINE</span><strong id="fe-houses-offline-group-count">0</strong></div>
+                <div class="fe-houses-pills" id="fe-houses-pills-offline"></div>
+              </section>
+            </div>
+          </div>
+          <div class="fe-module-card fe-module-ff" data-module="ff" hidden>
+            <div class="fe-module-icon"><i class="ri-shopping-cart-line"></i></div>
+            <div class="fe-module-name">FF OFICIAL</div>
+            <div class="fe-module-desc">Compras inteligentes com IA e melhores ofertas</div>
+            <div class="fe-module-stat-label">OFERTAS ATIVAS</div>
+            <div class="fe-module-stat">128</div>
+            <button class="fe-btn-secondary" disabled>ENTRAR <i class="ri-arrow-right-s-line"></i></button>
+          </div>
+          <div class="fe-module-card fe-module-ai" data-module="ai" hidden>
+            <div class="fe-module-icon"><i class="ri-shield-star-line"></i></div>
+            <div class="fe-module-name">MILITARY AI</div>
+            <div class="fe-module-desc">Treino, evolução e saúde com inteligência artificial</div>
+            <div class="fe-module-stat-label">MISSÕES DO DIA</div>
+            <div class="fe-module-stat">7</div>
+            <button class="fe-btn-secondary" disabled>ENTRAR <i class="ri-arrow-right-s-line"></i></button>
+          </div>
+          <div class="fe-module-card fe-module-new" data-module="new" hidden>
+            <div class="fe-module-icon"><i class="ri-add-circle-line"></i></div>
+            <div class="fe-module-name">NOVO MÓDULO</div>
+            <div class="fe-module-desc">Instale novos módulos e expanda seu sistema</div>
+            <div class="fe-module-stat-label">&nbsp;</div>
+            <div class="fe-module-stat">&nbsp;</div>
+            <button class="fe-btn-install" disabled>INSTALAR <i class="ri-arrow-right-s-line"></i></button>
+          </div>
+        </div>
+
+        <section class="fe-coverage-card" id="fe-coverage-card" aria-live="polite">
+          <div class="fe-coverage-head">
+            <div>
+              <h3>COBERTURA DOS READERS</h3>
+              <p id="fe-coverage-stamp">Atualizando...</p>
+            </div>
+            <button class="fe-btn-ghost-sm" id="fe-coverage-details">DETALHES DA COLETA</button>
+          </div>
+          <div class="fe-coverage-grid" id="fe-coverage-grid">
+            <div class="fe-coverage-empty">Carregando cobertura real...</div>
+          </div>
+        </section>
+
+        <div class="fe-secondary-nav">
+          <button class="fe-sec-btn" id="fe-sec-historico" data-nav="missions" hidden><i class="ri-time-line"></i><span>HISTÓRICO</span><small>Operações e registros</small></button>
+          <button class="fe-sec-btn" id="fe-sec-relatorios" data-nav="auditor" hidden><i class="ri-bar-chart-grouped-line"></i><span>RELATÓRIOS</span><small>Desempenho e análises</small></button>
+          <button class="fe-sec-btn" id="fe-sec-diagnostico" data-nav="live-audit-lab"><i class="ri-heart-pulse-line"></i><span>DIAGNÓSTICO</span><small>Status e integridade</small><small id="fe-diagnostic-summary">0 ELIGIBLE | 0 CONDITIONAL | 0 BLOCKED</small></button>
+          <button class="fe-sec-btn" id="fe-sec-source" data-nav="source-intelligence" hidden><i class="ri-search-eye-line"></i><span>SOURCE</span><small>Fontes e similaridades</small></button>
+          <button class="fe-sec-btn" id="fe-sec-backup" data-nav="backup-manager" hidden><i class="ri-cloud-upload-line"></i><span>BACKUP</span><small>Segurança de dados</small></button>
+          <button class="fe-sec-btn" id="fe-sec-logs" data-nav="logs-bets-exchanges"><i class="ri-file-list-3-line"></i><span>DIAGNÓSTICO DAS CASAS</span><small>Saúde, origem e cruzamentos</small></button>
+          <button class="fe-sec-btn" id="fe-sec-atualizacoes" hidden><i class="ri-refresh-line"></i><span>ATUALIZAÇÕES</span><small>Sistema e módulos</small></button>
+          <button class="fe-sec-btn" id="fe-sec-suporte" hidden><i class="ri-headphone-line"></i><span>SUPORTE</span><small>Ajuda e documentação</small></button>
+        </div>
+      </div>
+
+      <footer class="fe-footer">
+        <span><i class="ri-lock-line"></i> SEGURANÇA ATIVA</span>
+        <span><i class="ri-wifi-line"></i> CONEXÃO ESTÁVEL</span>
+        <span class="fe-footer-brand">FALLAH ENGINE © 2026 — TODOS OS DIREITOS RESERVADOS</span>
+        <span>VERSÃO 1.0.0 | PATCH 137</span>
+        <span id="fe-footer-build">BUILD --.--.--</span>
+      </footer>
+    </section>
+
+    <!-- FALLAH ENGINE ARBITRAGE PANEL -->
+    <section class="fe-page" id="fe-arbitrage">
+      <div class="fe-arb-topbar">
+        <button class="fe-back-btn" data-nav="fe-home"><i class="ri-arrow-left-s-line"></i></button>
+        <div class="fe-arb-logo"><span class="fe-logo-fallah">FALLAH</span><span class="fe-logo-engine">ENGINE</span></div>
+        <div class="fe-arb-subtitle">ARBITRAGEM</div>
+        <div class="fe-arb-topbar-center" id="fe-arb-houses-bar">
+          <!-- pills injected by JS -->
+        </div>
+        <div class="fe-topbar-right">
+          <div class="fe-clock"><div id="fe-arb-clock"></div></div>
+          <button class="fe-icon-btn" id="fe-arb-alerts-btn"><i class="ri-notification-3-line"></i><span class="fe-badge" id="fe-arb-badge" hidden></span><span>ALERTAS</span></button>
+          <button class="fe-icon-btn" id="fe-arb-sound-btn" title="Som"><i class="ri-volume-up-line"></i><span>SOM</span></button>
+          <button class="fe-icon-btn" id="fe-arb-config-btn"><i class="ri-settings-3-line"></i><span>CONFIGURAÇÕES</span></button>
+        </div>
+      </div>
+
+      <div class="fe-arb-body">
+        <!-- FILTERS SIDEBAR -->
+        <aside class="fe-arb-sidebar" id="fe-arb-sidebar">
+          <div class="fe-filter-section">
+            <div class="fe-filter-title">FILTROS RÁPIDOS</div>
+            <div class="fe-filter-label">TIPO DE ARBITRAGEM</div>
+            <div class="fe-btn-group" id="fe-arb-type-filter">
+              <button class="fe-pill" data-value="2">2 CASAS</button>
+              <button class="fe-pill" data-value="3">3 CASAS</button>
+              <button class="fe-pill active" data-value="all">TODAS</button>
+            </div>
+
+            <div class="fe-filter-label">LUCRO MÍNIMO</div>
+            <div class="fe-slider-row">
+              <input type="range" id="fe-filter-profit-min" min="0" max="5" step="0.01" value="0.01" />
+              <input type="number" id="fe-filter-profit-min-input" min="0" max="100" step="0.01" value="0.01" style="width:82px" aria-label="Lucro mínimo percentual" />
+              <span id="fe-filter-profit-min-val">0.01 %</span>
+            </div>
+            <div class="fe-btn-row"><button class="fe-pill-sm" id="fe-save-profit">SALVAR LUCRO MÍNIMO</button></div>
+
+            <div class="fe-filter-label">ESPORTES</div>
+            <div id="fe-filter-sports-list" class="fe-houses-list fe-sports-list"></div>
+            <div class="fe-btn-row">
+              <button class="fe-pill-sm" id="fe-sports-all">TODOS</button>
+              <button class="fe-pill-sm" id="fe-sports-none">NENHUM</button><button class="fe-pill-sm" id="fe-save-sports">SALVAR ESPORTES</button>
+            </div>
+            <div class="fe-filter-hint">Mercados e métodos: TODOS, automaticamente.</div>
+
+            <div class="fe-filter-label">CASAS</div>
+            <div id="fe-filter-houses-list" class="fe-houses-list">
+              <!-- injected by JS -->
+            </div>
+            <div class="fe-btn-row">
+              <button class="fe-pill-sm" id="fe-houses-all">TODAS</button>
+              <button class="fe-pill-sm" id="fe-save-houses">SALVAR CASAS</button>
+              <button class="fe-pill-sm" id="fe-houses-none">NENHUMA</button>
+            </div>
+
+            <button class="fe-btn-ghost" id="fe-filter-clear"><i class="ri-delete-bin-6-line"></i> LIMPAR FILTROS</button>
+          </div>
+
+          <div class="fe-filter-section fe-robo-section">
+            <div class="fe-filter-title">🤖 ROBÔ FALLAH</div>
+            <div class="fe-robo-desc">Conecte o Robô Fallah para enviar e executar oportunidades.</div>
+            <div class="fe-robo-row"><span>STATUS</span><span class="fe-dot-red" id="fe-robo-dot"></span><span id="fe-robo-status">DESCONECTADO</span></div>
+            <button class="fe-btn-connect" id="fe-robo-connect-btn">CONECTAR</button>
+          </div>
+
+          <div class="fe-filter-section">
+            <div class="fe-filter-title">ALERTAS SONOROS</div>
+            <div class="fe-filter-label">SOM ATUAL</div>
+            <div class="fe-sound-row">
+              <select id="fe-sound-select" class="fe-select">
+                <option value="cash">Lucro Alto 1</option>
+                <option value="coin">Moeda</option>
+                <option value="bell">Alerta Premium</option>
+              </select>
+              <button class="fe-icon-btn-sm" id="fe-sound-test"><i class="ri-play-line"></i></button>
+            </div>
+            <div class="fe-filter-label">VOLUME</div>
+            <div class="fe-slider-row">
+              <input type="range" id="fe-sound-volume" min="0" max="100" step="5" value="70" />
+              <span id="fe-sound-volume-val">70%</span>
+            </div>
+            <label class="fe-toggle-row"><input type="checkbox" id="fe-sound-mute" /><span>SILENCIAR ALERTAS</span></label><div class="fe-btn-row"><button class="fe-pill-sm" id="fe-save-sound">SALVAR SOM</button><label class="fe-pill-sm" style="cursor:pointer">+ INCLUIR SOM<input id="fe-sound-add" type="file" accept="audio/*" hidden></label><button class="fe-pill-sm" id="fe-sound-remove">REMOVER SOM</button></div>
+          </div>
+        </aside>
+
+        <!-- MAIN AREA -->
+        <div class="fe-arb-main">
+          <div class="fe-arb-stats-bar">
+            <div class="fe-stat-chip"><span class="fe-stat-label">OPORTUNIDADES</span><span class="fe-stat-val green" id="fe-arb-opp-count">0</span><span class="fe-stat-sub">Ao vivo</span></div>
+            <div class="fe-stat-chip"><span class="fe-stat-label">MELHOR LUCRO</span><span class="fe-stat-val green" id="fe-arb-best-profit">0%</span><span class="fe-stat-sub">Líquido</span></div>
+            <div class="fe-stat-chip"><span class="fe-stat-label">LUCRO MÉDIO</span><span class="fe-stat-val" id="fe-arb-avg-profit">0%</span><span class="fe-stat-sub">Líquido</span></div>
+            <div class="fe-stat-chip"><span class="fe-stat-label">MERCADOS</span><span class="fe-stat-val" id="fe-arb-markets">0</span><span class="fe-stat-sub">Monitorados</span></div>
+            <div class="fe-stat-chip"><span class="fe-stat-label">ÚLTIMA ATUALIZAÇÃO</span><span class="fe-stat-val" id="fe-arb-last-update">--:--:--</span><span class="fe-stat-sub">&nbsp;</span></div>
+            <div class="fe-stat-chip"><span class="fe-stat-label">ATUALIZAÇÃO AUTOMÁTICA</span><select class="fe-auto-interval-select" id="fe-arb-auto-interval" title="Intervalo de atualização"><option value="3000">3s</option><option value="5000">5s</option><option value="10000">10s</option><option value="15000">15s</option><option value="30000">30s</option></select><span class="fe-stat-sub">Tempo real</span><button class="fe-refresh-icon" id="fe-arb-refresh-btn" title="Atualizar agora"><i class="ri-refresh-line"></i></button></div>
+          </div>
+
+          <div class="fe-arb-proof" id="fe-arb-proof">
+            <strong>PROVA DO MOTOR — PATCH 137</strong>
+            <span>Eventos <b id="fe-proof-events">0</b></span>
+            <span>2+ casas <b id="fe-proof-common">0</b></span>
+            <span>Mercados cruzados <b id="fe-proof-markets">0</b></span>
+            <span>Odds atuais <b id="fe-proof-quotes">0</b></span>
+            <span>Combinações <b id="fe-proof-combos">0</b></span>
+            <span>BACK×BACK <b id="fe-proof-bb">0</b></span>
+            <span>BACK×LAY <b id="fe-proof-bl">0</b></span>
+            <span>N-WAY <b id="fe-proof-nway">0</b></span>
+            <span>Matemáticas <b id="fe-proof-math">0</b></span>
+            <span>Executáveis <b id="fe-proof-exec">0</b></span><span>Rej. temporal <b id="fe-proof-rej-temporal">0</b></span><span>Rej. mercado <b id="fe-proof-rej-market">0</b></span><span>Rej. runner <b id="fe-proof-rej-runner">0</b></span><span>Rej. matemática <b id="fe-proof-rej-math">0</b></span>
+          </div>
+
+          <div class="fe-arb-table-header">
+            <span class="fe-th-profit">LUCRO LÍQUIDO</span>
+            <span class="fe-th-event">EVENTO</span>
+            <span class="fe-th-market">MERCADO</span>
+            <span class="fe-th-sel">SELEÇÃO</span>
+            <span class="fe-th-houses">CASAS</span>
+            <span class="fe-th-odds">ODDS</span>
+            <span class="fe-th-profit2">LUCRO</span>
+            <span class="fe-th-age">ATUALIZADO</span>
+            <span class="fe-th-action">ABRIR</span>
+          </div>
+
+          <div id="fe-arb-list" class="fe-arb-list">
+            <div class="fe-arb-empty" id="fe-arb-empty">
+              <i class="ri-search-eye-line"></i>
+              <p>NENHUMA ARBITRAGEM DISPONÍVEL NO MOMENTO</p>
+              <small>Monitorando dados reais em tempo real...</small>
+            </div>
+          </div>
+
+          <div class="fe-arb-footer-bar">
+            <button class="fe-btn-ghost-sm" id="fe-arb-refresh-now"><i class="ri-refresh-line"></i> ATUALIZAR AGORA</button>
+            <button class="fe-btn-ghost-sm" id="fe-arb-export"><i class="ri-download-line"></i> EXPORTAR OPORTUNIDADES</button>
+            <button class="fe-btn-ghost-sm" id="fe-arb-sound-label"><i class="ri-volume-up-line"></i> SOM DE ALERTA: <span id="fe-arb-sound-name">LUCRO ALTO</span></button>
+            <button class="fe-btn-auto" id="fe-arb-auto-btn"><i class="ri-robot-line"></i> MODO AUTOMÁTICO: <span id="fe-arb-auto-label">ATIVO</span></button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CALCULATOR MODAL -->
+    <div class="fe-modal-overlay" id="fe-calc-modal" hidden>
+      <div class="fe-modal fe-calc-modal">
+        <div class="fe-modal-header">
+          <span>CALCULADORA DE ARBITRAGEM</span>
+          <button class="fe-modal-close" id="fe-calc-close" type="button" onclick="feCloseCalc()"><i class="ri-close-line"></i></button>
+        </div>
+        <div id="fe-calc-body" class="fe-calc-body">
+          <!-- injected by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- LEGACY PANEL (collapsible) -->
+    <div class="fe-legacy-panel" id="fe-legacy-panel" hidden>
+      <div class="fe-legacy-header">
+        <span><i class="ri-tools-line"></i> FERRAMENTAS TÉCNICAS — MODO AVANÇADO</span>
+        <button id="fe-legacy-close"><i class="ri-close-line"></i></button>
+      </div>
+
+  <header class="topo-app">
+    <div>
+      <h1>FALLAH AGENT</h1>
+      <p>Plataforma modular para engenharia de projetos, automação e operações com IA.</p>
+    </div>
+    <div class="topo-acoes">
+      <button id="toggleTheme" type="button" title="Alternar tema"><i class="ri-contrast-2-line"></i><span>Tema</span></button>
+      <button id="openPreferencesTop" type="button" title="Abrir preferências"><i class="ri-settings-3-line"></i><span>Preferências</span></button>
+    </div>
+  </header>
+
+  <nav aria-label="Módulos principais">
+    <button data-tab="dashboard" class="active"><i class="ri-dashboard-horizontal-line"></i><span>Painel</span></button>
+    <button data-tab="assistant" hidden><i class="ri-magic-line"></i><span>Assistente</span></button>
+    <button data-tab="explorer" hidden><i class="ri-folder-2-line"></i><span>Explorador</span></button>
+    <button data-tab="editor" hidden><i class="ri-code-box-line"></i><span>Editor</span></button>
+    <button data-tab="zip" hidden><i class="ri-file-zip-line"></i><span>Gerenciador ZIP</span></button>
+    <button data-tab="scanner" hidden><i class="ri-radar-line"></i><span>Scanner</span></button>
+    <button data-tab="missions" hidden><i class="ri-task-line"></i><span>Missões</span></button>
+    <button data-tab="terminal" hidden><i class="ri-terminal-box-line"></i><span>Terminal</span></button>
+    <button data-tab="chat" hidden><i class="ri-robot-2-line"></i><span>Chat IA</span></button>
+    <button data-tab="ai-manager" hidden><i class="ri-brain-line"></i><span>AI Manager</span></button>
+    <button data-tab="preferences" hidden><i class="ri-settings-5-line"></i><span>Preferências</span></button>
+    <button data-tab="patch-manager" hidden><i class="ri-git-merge-line"></i><span>Patch Manager</span></button>
+    <button data-tab="backup-manager" hidden><i class="ri-database-2-line"></i><span>Backup Manager</span></button>
+    <button data-tab="tests" hidden><i class="ri-test-tube-line"></i><span>Testes</span></button>
+    <button data-tab="auditor" hidden><i class="ri-shield-check-line"></i><span>Auditoria</span></button>
+    <button data-tab="live-audit-lab"><i class="ri-flask-line"></i><span>Live Audit Lab</span></button>
+    <button data-tab="source-intelligence" hidden><i class="ri-search-eye-line"></i><span>Source Intelligence</span></button>
+    <button data-tab="logs-bets-exchanges"><i class="ri-file-list-3-line"></i><span>Diagnóstico das Casas</span></button>
+    <button type="button" id="openDiscoveryRegistration"><i class="ri-add-circle-line"></i><span>Cadastrar Casa</span></button>
+    <button data-tab="comparator" hidden><i class="ri-git-compare-line"></i><span>Comparador</span></button>
+  </nav>
+
+  <main>
+    <section id="dashboard" class="active">
+      <h2>Painel</h2>
+      <div class="dashboard-grid">
+        <div><strong>Status:</strong> <span id="statusText">Carregando...</span></div>
+        <div><strong>Raiz do projeto:</strong> <span id="rootPath">Carregando...</span></div>
+        <div><strong>Módulos disponíveis:</strong> Assistente, Explorador, Editor, ZIP, Scanner, Missões, Terminal e Chat IA</div>
+        <div class="workspace-health-card">
+          <div class="workspace-health-header">
+            <h3>Saúde do Workspace</h3>
+            <button id="smartCleanupButton" type="button" title="Executar limpeza inteligente">🧹 Limpeza Inteligente</button>
+          </div>
+          <div class="workspace-health-grid">
+            <div><strong>Uso atual do disco:</strong> <span id="healthDiskUsage">-</span></div>
+            <div><strong>Uso do workspace:</strong> <span id="healthWorkspaceUsage">-</span></div>
+            <div><strong>Uso da pasta temp:</strong> <span id="healthTempUsage">-</span></div>
+            <div><strong>Uso da pasta logs:</strong> <span id="healthLogsUsage">-</span></div>
+            <div><strong>Uso da pasta cache:</strong> <span id="healthCacheUsage">-</span></div>
+            <div><strong>Uso da pasta backups:</strong> <span id="healthBackupsUsage">-</span></div>
+            <div><strong>Uso da pasta workspace:</strong> <span id="healthWorkspaceFolderUsage">-</span></div>
+            <div><strong>Uso da pasta projetos:</strong> <span id="healthProjectsUsage">-</span></div>
+            <div><strong>Quantidade de arquivos:</strong> <span id="healthFileCount">0</span></div>
+            <div><strong>Quantidade de ZIPs:</strong> <span id="healthZipCount">0</span></div>
+            <div><strong>Quantidade de temporários:</strong> <span id="healthTemporaryCount">0</span></div>
+            <div><strong>Status:</strong> <span id="healthStatus">🟢 Saudável</span></div>
+          </div>
+          <div id="cleanupPreviewPanel" class="assistant-create-panel" hidden>
+            <h4>Itens selecionados para remoção</h4>
+            <label><input id="cleanupIncludeBackups" type="checkbox" /> Incluir backups antigos (exige confirmação adicional)</label>
+            <div id="cleanupPreviewSummary" class="message"></div>
+            <div id="cleanupPreviewCategories"></div>
+            <div class="actions-row">
+              <button id="confirmSmartCleanup" type="button">Confirmar limpeza</button>
+              <button id="cancelSmartCleanup" type="button">Cancelar</button>
+            </div>
+          </div>
+          <div class="workspace-health-lists">
+            <div>
+              <h4>10 maiores arquivos</h4>
+              <ol id="healthTopFiles"></ol>
+            </div>
+            <div>
+              <h4>10 maiores pastas</h4>
+              <ol id="healthTopFolders"></ol>
+            </div>
+          </div>
+          <div id="healthAlerts" class="workspace-health-alerts"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="assistant">
+      <h2>Central Operacional</h2>
+      <div class="assistant-layout">
+        <div class="assistant-header">
+          <p>Cadastre casas, valide a coleta e controle o motor de arbitragem.</p>
+          <div class="actions-row"><button id="systemOfflineButton" type="button">DESLIGAR TODAS</button><button id="systemOnlineButton" type="button">LIGAR TODAS</button><strong id="systemOperationalStatus">Verificando...</strong><button id="refreshAssistantModules" type="button"><i class="ri-refresh-line"></i><span>Atualizar</span></button></div>
+        </div>
+        <h3>FUNÇÕES PRINCIPAIS</h3>
+        <div id="assistantModuleCards" class="assistant-cards" aria-live="polite"></div>
+        <div class="assistant-create-panel">
+          <h3 id="assistantModuleTitle">Configuração do módulo</h3>
+          <div id="assistantModuleDetails" class="message">Selecione Configurar em um módulo para visualizar sua estrutura.</div>
+        </div>
+        <div id="assistantResult" class="message"></div>
+      </div>
+    </section>
+
+    <section id="explorer">
+      <h2>Explorador de Projetos</h2>
+      <div class="explorer-toolbar premium">
+        <div class="toolbar-group search-group">
+          <i class="ri-search-line" aria-hidden="true"></i>
+          <input id="explorerSearch" placeholder="Pesquisa instantânea de arquivos e pastas" title="Pesquisar arquivos e pastas" />
+          <button id="clearExplorerSearch" title="Limpar pesquisa"><i class="ri-close-line"></i><span>Limpar</span></button>
+        </div>
+        <label class="system-files-toggle">
+          <input id="showSystemFiles" type="checkbox" />
+          <span>Mostrar arquivos do sistema</span>
+        </label>
+      </div>
+
+      <div class="explorer-commandbar" role="toolbar" aria-label="Barra de ferramentas do explorador">
+        <button id="toolbarNewFile" type="button"><i class="ri-file-add-line"></i><span>Novo</span></button>
+        <button id="toolbarNewFolder" type="button"><i class="ri-folder-add-line"></i><span>Nova Pasta</span></button>
+        <button id="toolbarCopy" type="button"><i class="ri-file-copy-line"></i><span>Copiar</span></button>
+        <button id="toolbarCut" type="button"><i class="ri-scissors-cut-line"></i><span>Recortar</span></button>
+        <button id="toolbarPaste" type="button"><i class="ri-clipboard-line"></i><span>Colar</span></button>
+        <button id="toolbarDuplicate" type="button"><i class="ri-file-copy-2-line"></i><span>Duplicar</span></button>
+        <button id="toolbarMove" type="button"><i class="ri-drag-move-line"></i><span>Mover</span></button>
+        <button id="toolbarRename" type="button"><i class="ri-edit-2-line"></i><span>Renomear</span></button>
+        <button id="toolbarDelete" type="button"><i class="ri-delete-bin-7-line"></i><span>Excluir</span></button>
+        <button id="refreshExplorer" type="button"><i class="ri-refresh-line"></i><span>Atualizar</span></button>
+        <button id="toolbarFavorite" type="button"><i class="ri-star-line"></i><span>Favoritar</span></button>
+        <button id="toolbarSettings" type="button"><i class="ri-settings-3-line"></i><span>Configurações</span></button>
+        <button id="toolbarZip" type="button"><i class="ri-file-zip-line"></i><span>Compactar</span></button>
+        <button id="toolbarExtract" type="button"><i class="ri-inbox-unarchive-line"></i><span>Extrair</span></button>
+        <button id="toolbarImport" type="button"><i class="ri-download-cloud-2-line"></i><span>Importar</span></button>
+        <button id="toolbarExport" type="button"><i class="ri-upload-cloud-2-line"></i><span>Exportar</span></button>
+      </div>
+
+      <div class="explorer-layout premium-layout">
+        <aside class="explorer-sidebar" id="explorerSidebar">
+          <div class="sidebar-section">
+            <div class="sidebar-section-title">Favoritos</div>
+            <ul class="sidebar-list" id="favoriteList"></ul>
+          </div>
+          <div class="sidebar-section">
+            <div class="sidebar-section-title">Recentes</div>
+            <ul class="sidebar-list" id="recentList"></ul>
+          </div>
+          <div class="sidebar-section">
+            <div class="sidebar-section-title">Ãrvore de Arquivos</div>
+            <div class="file-tree" id="projectTree" tabindex="0"></div>
+          </div>
+          <div class="sidebar-resize-handle" id="sidebarResize" title="Arrastar para redimensionar painel lateral"></div>
+        </aside>
+
+        <div class="explorer-main">
+          <div class="breadcrumb" id="explorerBreadcrumb"></div>
+          <div class="explorer-panel">
+            <div class="explorer-details">
+              <div class="explorer-panel-header">
+                <h3 id="explorerPanelTitle">Conteúdo</h3>
+                <div class="list-status" id="explorerStatusText"></div>
+              </div>
+              <div class="explorer-panel-actions">
+                <button id="newFile" type="button" title="Criar novo arquivo nesta pasta"><i class="ri-file-add-line"></i><span>Novo Arquivo</span></button>
+                <button id="newFolder" type="button" title="Criar nova pasta nesta pasta"><i class="ri-folder-add-line"></i><span>Nova Pasta</span></button>
+                <button id="explorerNewFile" type="button" class="hidden" title="Criar novo arquivo nesta pasta">Novo Arquivo</button>
+                <button id="explorerNewFolder" type="button" class="hidden" title="Criar nova pasta nesta pasta">Nova Pasta</button>
+              </div>
+              <div id="explorerFolderSummary" class="explorer-folder-summary"></div>
+              <div class="explorer-table-wrap">
+                <table class="explorer-table" aria-label="Tabela de arquivos">
+                  <thead>
+                    <tr>
+                      <th data-sort-key="icon" title="Ordenar por Ã­cone">Ãcone</th>
+                      <th data-sort-key="name" title="Ordenar por nome">Nome</th>
+                      <th data-sort-key="type" title="Ordenar por tipo">Tipo</th>
+                      <th data-sort-key="size" title="Ordenar por tamanho">Tamanho</th>
+                      <th data-sort-key="modifiedAt" title="Ordenar por última modificação">Última modificação</th>
+                      <th data-sort-key="childFileCount" title="Ordenar por quantidade de arquivos">Arquivos</th>
+                      <th data-sort-key="childDirectoryCount" title="Ordenar por quantidade de subpastas">Subpastas</th>
+                    </tr>
+                  </thead>
+                  <tbody id="fileList"></tbody>
+                </table>
+                <div id="explorerEmptyState" class="explorer-empty hidden">
+                  <div class="explorer-empty-icon"><i class="ri-folder-open-line"></i></div>
+                  <div class="explorer-empty-text">Esta pasta está vazia.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <aside class="explorer-properties-panel" id="explorerPropertiesPanel">
+          <div class="properties-header">
+            <i class="ri-information-line"></i>
+            <h3>Propriedades</h3>
+          </div>
+          <div id="explorerPropertiesBody" class="properties-body">
+            <p class="muted">Selecione um item para visualizar detalhes.</p>
+          </div>
+        </aside>
+      </div>
+      <div class="loading-overlay hidden" id="explorerLoader">Carregando...</div>
+      <div class="context-menu hidden" id="explorerContextMenu"></div>
+    </section>
+
+    <section id="editor">
+      <h2>Editor de Arquivos</h2>
+      <div class="editor-header">
+        <div class="editor-tabs" id="editorTabs"></div>
+        <div class="editor-actions">
+          <button id="findFile">Pesquisar</button>
+          <button id="replaceFile">Substituir</button>
+          <button id="zoomOut">Zoom -</button>
+          <button id="zoomIn">Zoom +</button>
+          <button id="saveFile">Salvar</button>
+          <button id="saveAsFile">Salvar Como</button>
+        </div>
+      </div>
+      <div class="editor-meta">
+        <input id="editorPath" placeholder="Caminho relativo do arquivo ou selecione no explorador" />
+        <button id="loadFile">Abrir</button>
+      </div>
+      <div id="editorContainer" class="editor-container"></div>
+      <div id="editorMessage" class="message"></div>
+      <div class="status-bar" id="editorStatus">Pronto</div>
+    </section>
+
+    <section id="zip">
+      <h2>Gerenciador ZIP</h2>
+      <div class="zip-panel">
+        <label>Caminho para compactar:</label>
+        <input id="zipPath" placeholder="Informe o caminho da pasta ou arquivo" />
+        <button id="createZip">Criar ZIP</button>
+        <button id="exportProjectZip" type="button">Exportar Projeto</button>
+      </div>
+      <div class="zip-panel">
+        <label>Importar arquivo ZIP:</label>
+        <input id="zipImportFile" type="file" accept=".zip" class="hidden" />
+        <button id="importZip" type="button">Importar ZIP</button>
+      </div>
+      <div id="zipResult" class="message"></div>
+    </section>
+
+    <section id="scanner">
+      <h2>Scanner</h2>
+      <div class="scanner-grid">
+        <div class="scanner-card scanner-controls">
+          <button id="runScanner">Executar Varredura</button>
+          <button id="cancelScanner" type="button" class="hidden">Cancelar Varredura</button>
+          <div class="progress-bar" id="scannerProgressBar"><div class="progress-fill" id="scannerProgressFill" style="width: 0%"></div></div>
+          <div class="scanner-status">
+            <div><strong>Pastas:</strong> <span id="scannerFolderCount">0</span></div>
+            <div><strong>Arquivos:</strong> <span id="scannerFileCount">0</span></div>
+            <div><strong>Status:</strong> <span id="scannerStatus">ocioso</span></div>
+          </div>
+        </div>
+        <div class="scanner-card scanner-summary">
+          <h3>Resumo do Projeto</h3>
+          <div id="scannerSummary"></div>
+        </div>
+      </div>
+      <div class="scanner-card scanner-tree-card">
+        <div class="scanner-tree-header">
+          <h3>Ãrvore do Projeto</h3>
+          <input id="scannerSearch" placeholder="Pesquisar na árvore" />
+        </div>
+        <div id="scannerTree" class="scanner-tree"></div>
+        <button id="loadMoreScanner" type="button" class="hidden">Carregar mais itens</button>
+      </div>
+      <div class="scanner-card scanner-tech-card">
+        <h3>Tecnologias Detectadas</h3>
+        <div id="scannerTechnologies" class="scanner-tech-list"></div>
+      </div>
+    </section>
+
+    <section id="missions">
+      <h2>Missões</h2>
+      <div class="missions-grid">
+        <div class="mission-card mission-form-card">
+          <h3>Criar Missão</h3>
+          <div class="form-row">
+            <label for="missionTitle">TÃ­tulo</label>
+            <input id="missionTitle" placeholder="Informe o tÃ­tulo da missão" />
+          </div>
+          <div class="form-row">
+            <label for="missionDescription">Descrição</label>
+            <textarea id="missionDescription" rows="5" placeholder="Informe a descrição da missão"></textarea>
+          </div>
+          <div class="form-row">
+            <label for="missionCategory">Categoria</label>
+            <input id="missionCategory" placeholder="Informe a categoria" />
+          </div>
+          <div class="form-row">
+            <label for="missionPriority">Prioridade</label>
+            <select id="missionPriority">
+              <option value="low">Baixa</option>
+              <option value="medium" selected>Média</option>
+              <option value="high">Alta</option>
+            </select>
+          </div>
+          <div class="form-row actions-row">
+            <button id="createMission">Criar Missão</button>
+            <button id="refreshMissions" type="button">Atualizar</button>
+          </div>
+          <div id="missionMessage" class="message"></div>
+        </div>
+        <div class="mission-card mission-list-card">
+          <div class="mission-filters">
+            <input id="missionSearch" placeholder="Pesquisar missões" />
+            <select id="missionStatusFilter">
+              <option value="all">Todos os status</option>
+              <option value="pending">Pendente</option>
+              <option value="running">Em andamento</option>
+              <option value="completed">ConcluÃ­da</option>
+              <option value="failed">Falhou</option>
+            </select>
+            <select id="missionPriorityFilter">
+              <option value="all">Todas as prioridades</option>
+              <option value="high">Alta</option>
+              <option value="medium">Média</option>
+              <option value="low">Baixa</option>
+            </select>
+            <input id="missionCategoryFilter" placeholder="Filtrar por categoria" />
+          </div>
+          <h3>Lista de Missões</h3>
+          <div id="missionLoading" class="small-loading hidden">Carregando missões...</div>
+          <div id="missionsList" class="missions-list"></div>
+          <button id="loadMoreMissions" type="button" class="hidden">Carregar mais missões</button>
+        </div>
+      </div>
+      <div id="missionDetails" class="mission-details hidden">
+        <div class="mission-details-header">
+          <h3>Detalhes da Missão</h3>
+          <button id="closeMissionDetails">Fechar</button>
+        </div>
+        <div id="missionDetailsContent"></div>
+      </div>
+    </section>
+
+    <section id="terminal">
+      <h2>Terminal</h2>
+      <div class="terminal-panel">
+        <input id="terminalCommand" placeholder="Informe um comando de terminal" />
+        <button id="runCommand">Executar</button>
+        <button id="cancelTerminal" type="button" class="hidden">Cancelar</button>
+        <button id="clearTerminal" type="button">Limpar</button>
+      </div>
+      <pre id="terminalOutput"></pre>
+    </section>
+
+    <section id="chat">
+      <h2>Chat IA</h2>
+      <div class="chat-layout">
+        <aside class="chat-sidebar">
+          <div class="chat-sidebar-header">
+            <button id="newConversation">Nova</button>
+            <button id="importConversation">Importar</button>
+            <button id="exportConversation">Exportar JSON</button>
+            <button id="exportConversationTxt">TXT</button>
+            <button id="exportConversationMd">Markdown</button>
+          </div>
+          <input id="chatConversationSearch" placeholder="Pesquisar conversas" />
+          <select id="chatConversationSort" aria-label="Ordenar conversas">
+            <option value="recent">Mais recentes</option>
+            <option value="oldest">Mais antigas</option>
+            <option value="name">Nome</option>
+          </select>
+          <div id="conversationList" class="conversation-list"></div>
+          <button id="loadMoreConversations" type="button" class="hidden">Carregar mais conversas</button>
+          <input id="chatSearch" placeholder="Pesquisar mensagens" />
+          <input id="chatImportFile" type="file" accept=".json" class="hidden" />
+        </aside>
+        <div class="chat-main">
+          <div class="chat-header">
+            <h3 id="conversationTitle">Selecione uma conversa</h3>
+            <button id="renameConversation" type="button">Renomear</button>
+            <button id="duplicateConversation" type="button">Duplicar</button>
+            <button id="pinConversation" type="button">Fixar</button>
+            <button id="copyConversation" type="button">Copiar tudo</button>
+            <button id="shareConversation" type="button">Compartilhar</button>
+            <button id="clearConversation" type="button">Limpar</button>
+            <button id="deleteConversation" type="button">Excluir</button>
+            <button id="clearAllConversations" type="button">Limpar todas</button>
+          </div>
+          <div id="chatStatus" class="chat-status hidden">Processando...</div>
+          <div id="chatHistory" class="chat-history"></div>
+          <div class="chat-input-row">
+            <textarea id="chatInput" rows="9" placeholder="Digite uma mensagem"></textarea>
+            <input id="chatAttachment" type="file" multiple accept=".txt,.md,.pdf,.docx,.json,.csv,.zip,image/*" class="hidden" />
+            <button id="chatAttachmentButton" type="button" aria-expanded="false">+</button>
+            <div id="chatAttachmentMenu" class="chat-attachment-menu hidden">
+              <button type="button" data-attachment-action="document">ðŸ“„ Documento</button>
+              <button type="button" data-attachment-action="image">ðŸ–¼ Imagem</button>
+              <button type="button" data-attachment-action="zip">ðŸ“¦ ZIP</button>
+              <button type="button" data-attachment-action="folder">ðŸ“ Pasta</button>
+              <button type="button" data-attachment-action="clipboard">ðŸ“‹ Ãrea de transferência</button>
+              <button type="button" data-attachment-action="screenshot">ðŸ“¸ Captura de tela</button>
+            </div>
+            <button id="cancelChat" type="button" class="hidden">Stop</button>
+            <button id="sendChat">Enviar</button>
+          </div>
+          <div id="chatAttachments" class="chat-attachments"></div>
+          <div class="chat-footer-controls">
+            <select id="chatModel" aria-label="Modelo atual"><option value="">Modelo atual</option></select>
+            <select id="chatSpeed" aria-label="Velocidade"><option>Econômico</option><option selected>Balanceado</option><option>Rápido</option><option>Máxima Qualidade</option></select>
+            <select id="chatProfile" aria-label="Perfil"><option selected>Programador</option><option>Arquiteto</option><option>Analista</option><option>Marketing</option><option>Livre</option></select>
+            <select id="chatEnterBehavior" aria-label="Comportamento da tecla Enter"><option value="send" selected>Enter envia</option><option value="newline">Enter quebra linha</option></select>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="ai-manager">
+      <h2>AI Manager</h2>
+      <div class="preferences-grid">
+        <div class="pref-card ai-manager-card">
+          <h3>Configuração de Provider</h3>
+          <div class="form-row">
+            <label for="aiProviderSelect">Provider</label>
+            <select id="aiProviderSelect"></select>
+          </div>
+          <div class="form-row">
+            <label for="aiProviderStatus">Status</label>
+            <input id="aiProviderStatus" readonly placeholder="Status do provider" />
+            <span id="aiConnectionIndicator" aria-live="polite">â— Não testado</span>
+            <span id="aiResponseTime">Tempo de resposta: â€”</span>
+          </div>
+          <div class="form-row">
+            <label for="aiProviderModel">Modelo</label>
+            <input id="aiProviderModel" placeholder="Exemplo: gpt-5.3-codex" />
+          </div>
+          <div class="form-row">
+            <label for="aiProviderApiKey">Chave API (oculta)</label>
+            <input id="aiProviderApiKey" type="password" autocomplete="off" placeholder="Informe para salvar/atualizar" />
+            <div class="actions-row">
+              <button id="toggleAiApiKey" type="button">Mostrar chave</button>
+              <button id="copyAiApiKey" type="button">Copiar chave</button>
+            </div>
+          </div>
+          <div class="form-row">
+            <small id="aiProviderMaskHint" class="muted">Sem chave configurada.</small>
+          </div>
+          <div class="form-row actions-row">
+            <button id="aiTestButton" type="button">Testar</button>
+            <button id="aiSaveButton" type="button">Salvar</button>
+          </div>
+          <div id="aiManagerMessage" class="message"></div>
+          <div class="message">Providers preparados: OpenAI, Claude, Gemini, Ollama e OpenRouter.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="preferences">
+      <h2>Preferências</h2>
+      <div class="preferences-grid">
+        <div class="pref-card">
+          <h3>Aparência</h3>
+          <div class="form-row"><label for="prefTheme">Tema</label><select id="prefTheme"><option value="escuro">Escuro</option><option value="claro">Claro</option></select></div>
+          <div class="form-row"><label for="prefIconSet">Ãcones</label><select id="prefIconSet"><option value="remix">Profissional (Remix)</option></select></div>
+          <div class="form-row"><label for="prefFontSize">Tamanho da fonte</label><input id="prefFontSize" type="range" min="12" max="20" step="1" value="14" /></div>
+          <div class="form-row"><label for="prefZoom">Zoom de interface (%)</label><input id="prefZoom" type="range" min="90" max="130" step="5" value="100" /></div>
+        </div>
+        <div class="pref-card">
+          <h3>Explorador</h3>
+          <div class="form-row"><label for="prefTreeCompact">Compactação da árvore</label><input id="prefTreeCompact" type="range" min="16" max="26" step="1" value="18" /></div>
+          <div class="form-row"><label><input id="prefConfirmDelete" type="checkbox" checked /> Confirmar exclusões</label></div>
+          <div class="form-row"><label><input id="prefShowHints" type="checkbox" checked /> Exibir dicas e tooltips</label></div>
+        </div>
+        <div class="pref-card">
+          <h3>Sistema</h3>
+          <div class="form-row"><label for="prefLanguage">Idioma</label><input id="prefLanguage" value="Português (Brasil)" readonly /></div>
+          <div class="form-row"><label for="prefScannerAuto">Scanner automático (segundos)</label><input id="prefScannerAuto" type="number" min="0" max="300" value="0" /></div>
+          <div class="form-row actions-row"><button id="savePreferences" type="button"><i class="ri-save-3-line"></i><span>Salvar preferências</span></button></div>
+          <div id="preferencesResult" class="message"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="patch-manager">
+      <h2>PATCH MANAGER</h2>
+      <div class="preferences-grid">
+        <div class="pref-card">
+          <h3>Criar Patch</h3>
+          <div class="form-row"><label for="patchName">Nome</label><input id="patchName" value="PATCH" /></div>
+          <div class="form-row"><label for="patchVersion">Versão</label><input id="patchVersion" value="1.0.0" /></div>
+          <div class="form-row"><label for="patchAuthor">Autor</label><input id="patchAuthor" value="FALLAH" /></div>
+          <div class="form-row"><label for="patchDescription">Descrição</label><textarea id="patchDescription" rows="3"></textarea></div>
+          <div class="form-row"><label for="patchBasePath">Pasta base</label><input id="patchBasePath" value="C:\FallahAgent" /></div>
+          <div class="form-row"><label for="patchTargetPath">Pasta atualizada</label><input id="patchTargetPath" value="C:\FallahAgent" /></div>
+          <button id="createOfficialPatch" type="button">Criar Patch</button>
+        </div>
+        <div class="pref-card">
+          <h3>Aplicar e reverter</h3>
+          <div class="form-row"><label for="patchFilePath">Arquivo Patch</label><input id="patchFilePath" placeholder="Caminho do .fallah-patch.zip" /></div>
+          <div class="form-row"><label for="patchApplyTarget">Projeto de destino</label><input id="patchApplyTarget" value="C:\FallahAgent" /></div>
+          <button id="applyOfficialPatch" type="button">Aplicar Patch</button>
+          <button id="refreshPatchHistory" type="button">Atualizar histórico</button>
+          <div id="patchHistory" class="message">Nenhum histórico carregado.</div>
+        </div>
+      </div>
+      <pre id="patchManagerResult" class="terminal-output">Aguardando operação.</pre>
+    </section>
+
+    <section id="backup-manager">
+      <h2>BACKUP MANAGER</h2>
+      <div class="preferences-grid">
+        <div class="pref-card">
+          <h3>Novo Backup</h3>
+          <div class="form-row"><label for="backupName">Nome</label><input id="backupName" value="Backup FALLAH" /></div>
+          <div class="form-row"><label for="backupSourcePath">Origem</label><input id="backupSourcePath" value="C:\FallahAgent" /></div>
+          <div class="form-row"><label for="backupType">Tipo</label><select id="backupType"><option value="full">Completo</option><option value="incremental">Incremental</option></select></div>
+          <button id="createOfficialBackup" type="button">Criar Backup</button>
+          <button id="refreshBackupHistory" type="button">Atualizar histórico</button>
+        </div>
+        <div class="pref-card"><h3>Histórico</h3><div id="backupHistory" class="message">Nenhum histórico carregado.</div></div>
+      </div>
+      <pre id="backupManagerResult" class="terminal-output">Aguardando operação.</pre>
+    </section>
+
+    <section id="tests">
+      <h2>TESTES</h2>
+      <div class="toolbar" id="testRunnerActions">
+        <button data-test-group="all">Executar Todos</button><button data-test-group="backend">Backend</button><button data-test-group="frontend">Frontend</button>
+        <button data-test-group="ai">IA</button><button data-test-group="scanner">Scanner</button><button data-test-group="explorer">Explorer</button>
+        <button data-test-group="zip">ZIP</button><button data-test-group="terminal">Terminal</button><button data-test-group="missions">Missões</button>
+        <button data-test-group="chat">Chat</button><button data-test-group="ai-manager">AI Manager</button><button data-test-group="performance">Performance</button><button data-test-group="security">Segurança</button>
+      </div>
+      <pre id="testRunnerResult" class="terminal-output">Selecione um grupo de testes.</pre>
+    </section>
+
+    <section id="auditor">
+      <h2>AUDITORIA</h2>
+      <div class="pref-card">
+        <p>Arquitetura, dependências, duplicações, segurança, performance, memória, arquivos, CSS, HTML, JavaScript, Node, npm e versões.</p>
+        <button id="runCompleteAudit" type="button">AUDITORIA COMPLETA</button>
+      </div>
+      <pre id="auditorResult" class="terminal-output">Aguardando auditoria.</pre>
+    </section>
+
+    <section id="source-intelligence">
+      <h2>SOURCE INTELLIGENCE</h2>
+      <div class="preferences-grid">
+        <div class="pref-card">
+          <p>Diagnostico read-only para investigar fonte economica, similaridade de book, liquidez e correlacao temporal entre casas selecionadas.</p>
+          <div class="form-row">
+            <label>Casas</label>
+            <div class="actions-row">
+              <button id="sourceIntelligenceSelectAll" type="button">Selecionar todas</button>
+              <button id="sourceIntelligenceClearAll" type="button">Limpar selecao</button>
+            </div>
+            <div id="sourceIntelligenceHouses" class="message" style="max-height: 220px; overflow: auto; margin-top: 8px;">Carregando casas...</div>
+          </div>
+          <div class="form-row">
+            <label for="sourceIntelligenceDurationPreset">Janela de analise</label>
+            <select id="sourceIntelligenceDurationPreset">
+              <option value="1">1 minuto</option>
+              <option value="5" selected>5 minutos</option>
+              <option value="10">10 minutos</option>
+              <option value="30">30 minutos</option>
+              <option value="custom">Personalizado</option>
+            </select>
+          </div>
+          <div class="form-row" id="sourceIntelligenceCustomDurationRow" style="display:none;">
+            <label for="sourceIntelligenceDurationCustom">Duracao personalizada (minutos)</label>
+            <input id="sourceIntelligenceDurationCustom" type="number" min="1" max="30" value="5" />
+          </div>
+          <div class="actions-row">
+            <button id="runSourceIntelligence" type="button">INICIAR DIAGNOSTICO</button>
+            <button id="refreshSourceIntelligenceHistory" type="button">Carregar historico</button>
+            <button id="exportSourceIntelligenceJson" type="button">Exportar JSON</button>
+            <button id="compareSourceIntelligenceHistory" type="button">Comparar com anterior</button>
+          </div>
+          <div class="message" id="sourceIntelligenceProgress">
+            <div>Tempo decorrido: <strong id="sourceIntelligenceElapsed">0s</strong></div>
+            <div>Casas analisadas: <strong id="sourceIntelligenceHousesAnalyzed">-</strong></div>
+            <div>Eventos comuns encontrados: <strong id="sourceIntelligenceCommonEvents">0</strong></div>
+            <div>Mercados comuns encontrados: <strong id="sourceIntelligenceCommonMarkets">0</strong></div>
+            <div>Quotes comparadas: <strong id="sourceIntelligenceQuotesCompared">0</strong></div>
+            <div>Mudancas observadas: <strong id="sourceIntelligenceChangesObserved">0</strong></div>
+          </div>
+        </div>
+        <div class="pref-card">
+          <h3>Resumo</h3>
+          <div id="sourceIntelligenceSummary" class="message">Aguardando execução.</div>
+          <div id="sourceIntelligenceHistoryPanel" class="message" style="margin-top: 8px; max-height: 220px; overflow: auto;">Historico nao carregado.</div>
+        </div>
+      </div>
+      <pre id="sourceIntelligenceResult" class="terminal-output">Aguardando diagnóstico.</pre>
+    </section>
+
+    <section id="logs-bets-exchanges">
+      <h2>DIAGNÓSTICO DAS CASAS</h2>
+      <div class="dashboard-grid" style="grid-template-columns: 1fr;">
+        <div class="pref-card">
+          <h3>Filtros</h3>
+          <div class="form-row"><label for="lbe-house">Casa</label><select id="lbe-house"><option value="ALL">Todas as casas</option></select></div>
+          <div class="form-row"><label for="lbe-level">Nível</label><select id="lbe-level"><option value="ALL">Todos</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option><option value="CRITICAL">CRITICAL</option></select></div>
+          <div class="form-row"><label for="lbe-type">Tipo</label><select id="lbe-type"><option value="ALL">Todos</option><option value="CONEXAO">CONEXÃO</option><option value="READER">READER</option><option value="ENDPOINT">ENDPOINT</option><option value="HTTP">HTTP</option><option value="TIMEOUT">TIMEOUT</option><option value="RATE_LIMIT">RATE LIMIT</option><option value="HEARTBEAT">HEARTBEAT</option><option value="COLETA">COLETA</option><option value="NORMALIZACAO">NORMALIZAÇÃO</option><option value="MATCHING">MATCHING</option><option value="ODDS">ODDS</option><option value="ARBITRAGEM">ARBITRAGEM</option><option value="RECUPERACAO">RECUPERAÇÃO</option><option value="CIRCUIT_BREAKER">CIRCUIT BREAKER</option></select></div>
+          <div class="form-row"><label for="lbe-period">Período</label><select id="lbe-period"><option value="REALTIME">Tempo real</option><option value="LAST_5_MIN">Últimos 5 min</option><option value="LAST_15_MIN">Últimos 15 min</option><option value="LAST_1_HOUR">Última 1 hora</option><option value="TODAY">Hoje</option></select></div>
+          <div class="actions-row"><button id="lbe-refresh" type="button">Atualizar</button><button id="lbe-copy" type="button">Copiar Diagnóstico</button><button id="lbe-export" type="button">Exportar Diagnóstico</button></div>
+        </div>
+        <div class="pref-card"><h3>Saúde por Casa</h3><div id="lbe-summary" class="message">Aguardando atualização.</div></div>
+        <div class="pref-card"><h3>Origem e Independência</h3><div id="lbe-source-profile" class="message">Aguardando análise.</div></div>
+        <div class="pref-card"><h3>Participação nos Cruzamentos</h3><div id="lbe-crossing" class="message">Aguardando diagnóstico.</div></div>
+        <div class="pref-card"><h3>Timeline de Conexão</h3><div id="lbe-timeline" class="message" style="max-height: 220px; overflow:auto;">Aguardando atualização.</div></div>
+        <div class="pref-card"><h3>Linhas de Log</h3><div id="lbe-entries" class="message" style="max-height: 360px; overflow:auto;">Aguardando atualização.</div></div>
+        <pre id="lbe-output" class="terminal-output">Aguardando diagnóstico.</pre>
+      </div>
+    </section>
+
+    <section id="live-audit-lab">
+      <h2>AUDITORIA DE COBERTURA</h2>
+      <div id="coverageAuditPanelRoot" class="pref-card live-audit-wide-panel" style="border: 2px solid rgba(34, 197, 94, 0.25); padding: 16px; margin-bottom: 16px;">
+        <div id="coverageAuditPanelContent">Carregando auditoria de cobertura...</div>
+      </div>
+      <div data-live-audit-workspace="houses problems compare common search arbitrage" style="margin: 8px 0; font-size: 12px; color: #999; border-left: 2px solid #007bff; padding-left: 12px;">
+        Fluxo: CASAS → EVENTO → MERCADOS → ODDS → AUDITORIA → HOMOLOGAÇÃO
+      </div>
+
+    <style>
+      [hidden] { display: none !important; }
+        #live-audit-lab [hidden] { display: none !important; }
+        #coverageAuditPanelRoot { max-height: 72vh; overflow: auto; }
+        #coverageAuditPanelContent > div:first-child { position: sticky; top: 0; z-index: 3; background: var(--surface, #111827); padding-top: 4px; }
+        #live-audit-lab .live-audit-wide-panel {
+          width: 100%;
+          max-width: none;
+        }
+        #live-audit-lab .live-audit-actions-bar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: center;
+          margin-bottom: 10px;
+        }
+        #live-audit-lab .live-audit-house-list {
+          display: grid;
+          gap: 8px;
+        }
+        #live-audit-lab .live-audit-house-card {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 8px 10px;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 6px;
+          background: rgba(255, 255, 255, 0.03);
+          min-height: 52px;
+        }
+        #live-audit-lab .live-audit-house-main {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex: 1;
+          min-width: 0;
+        }
+        #live-audit-lab .live-audit-house-name {
+          font-weight: 700;
+          white-space: nowrap;
+        }
+        #live-audit-lab .live-audit-house-meta {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          font-size: 11px;
+          color: #cfd3d8;
+        }
+        #live-audit-lab .live-audit-chip {
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          border-radius: 999px;
+          padding: 2px 8px;
+          background: rgba(255, 255, 255, 0.04);
+        }
+        #live-audit-lab .cov-status {
+          display: inline-block;
+          border-radius: 999px;
+          padding: 2px 8px;
+          border: 1px solid rgba(255, 255, 255, 0.24);
+          font-size: 11px;
+          font-weight: 700;
+        }
+        #live-audit-lab .cov-status.ok {
+          color: #7be7a1;
+          border-color: rgba(34, 197, 94, 0.6);
+          background: rgba(34, 197, 94, 0.12);
+        }
+        #live-audit-lab .cov-status.warn {
+          color: #ffd57d;
+          border-color: rgba(245, 158, 11, 0.65);
+          background: rgba(245, 158, 11, 0.13);
+        }
+        #live-audit-lab .cov-status.bad {
+          color: #ffb3b3;
+          border-color: rgba(239, 68, 68, 0.62);
+          background: rgba(239, 68, 68, 0.12);
+        }
+        #live-audit-lab .cov-status.unk {
+          color: #d5dbe2;
+          border-color: rgba(148, 163, 184, 0.6);
+          background: rgba(148, 163, 184, 0.12);
+        }
+        #live-audit-lab .live-audit-row-actions {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          flex-shrink: 0;
+        }
+        #live-audit-lab .live-audit-secondary-btn {
+          padding: 4px 8px;
+          font-size: 11px;
+        }
+        #live-audit-lab .live-audit-danger-btn {
+          padding: 4px 8px;
+          font-size: 11px;
+          border: 1px solid rgba(255, 92, 92, 0.5);
+          color: #ffb5b5;
+          background: rgba(255, 92, 92, 0.08);
+          border-radius: 4px;
+        }
+        #live-audit-lab .live-audit-stage2-grid-3 {
+          display: grid;
+          grid-template-columns: minmax(220px, 2fr) minmax(180px, 1fr) minmax(180px, 1fr);
+          gap: 10px;
+        }
+        #live-audit-lab .live-audit-stage2-grid-2 {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 10px;
+          margin-top: 8px;
+        }
+        #live-audit-lab .live-audit-modality-tools {
+          display: flex;
+          gap: 0;
+          align-items: center;
+        }
+        #live-audit-lab .live-audit-modality-tools select {
+          width: 100%;
+          max-height: 220px;
+        }
+        #live-audit-lab .live-audit-date-wrap {
+          display: flex;
+          gap: 6px;
+          align-items: center;
+        }
+        #live-audit-lab .live-audit-calendar-btn {
+          width: 34px;
+          height: 34px;
+          border-radius: 4px;
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          background: rgba(255, 255, 255, 0.05);
+          color: #e6edf3;
+          cursor: pointer;
+          font-size: 16px;
+          line-height: 1;
+        }
+        #live-audit-lab .live-audit-candidate {
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          border-radius: 8px;
+          padding: 12px;
+          margin: 0 0 10px 0;
+          background: rgba(255, 255, 255, 0.02);
+        }
+        #live-audit-lab .live-audit-candidate-title {
+          font-size: 16px;
+          font-weight: 700;
+          margin-bottom: 6px;
+        }
+        #live-audit-lab .live-audit-coverage-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(220px, 1fr));
+          gap: 8px;
+          margin-top: 10px;
+        }
+        #live-audit-lab .live-audit-coverage-item {
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 6px;
+          padding: 8px;
+          font-size: 12px;
+          background: rgba(0, 0, 0, 0.18);
+        }
+        #live-audit-lab .live-audit-coverage-ok {
+          color: #67d58c;
+          font-weight: 700;
+        }
+        #live-audit-lab .live-audit-coverage-miss {
+          color: #d2d8df;
+          font-weight: 700;
+        }
+        @media (max-width: 1100px) {
+          #live-audit-lab .live-audit-stage2-grid-3 {
+            grid-template-columns: 1fr;
+          }
+          #live-audit-lab .live-audit-stage2-grid-2 {
+            grid-template-columns: 1fr;
+          }
+          #live-audit-lab .live-audit-coverage-grid {
+            grid-template-columns: 1fr;
+          }
+        }
+      .fe-filter-hint{font-size:10px;line-height:1.35;color:#9aa6bd;margin:6px 0 12px}.fe-sports-list{max-height:180px;overflow:auto;border:1px solid rgba(148,163,184,.25);border-radius:7px;padding:4px}
+</style>
+
+      <!-- ETAPA 1: CASAS -->
+      <div data-live-audit-workspace="search" class="pref-card live-audit-wide-panel" style="border: 2px solid rgba(0, 123, 255, 0.3); padding: 16px;" hidden>
+        <h3 style="color: #007bff; margin-bottom: 12px;">ETAPA 1 — CASAS PARA AUDITORIA</h3>
+        <div class="live-audit-actions-bar">
+          <button id="liveAuditSelectAllHouses" type="button">Selecionar todas</button>
+          <button id="liveAuditClearHouses" type="button">Limpar seleção</button>
+          <button id="liveAuditRefreshHouses" type="button">Atualizar casas</button>
+        </div>
+        <div id="liveAuditHouseList" class="message live-audit-house-list" style="background: rgba(0, 0, 0, 0.2); padding: 10px; border-radius: 4px;">Carregando casas...</div>
+      </div>
+
+      <!-- ETAPA 2: EVENTO -->
+      <div data-live-audit-workspace="search" class="pref-card live-audit-wide-panel" style="border: 2px solid rgba(255, 193, 7, 0.3); padding: 16px; margin-top: 8px;" hidden>
+        <h3 style="color: #ffc107; margin-bottom: 12px;">ETAPA 2 — PESQUISA UNIVERSAL DE EVENTO</h3>
+        <div class="live-audit-stage2-grid-3">
+          <div class="form-row">
+            <label for="liveAuditEventModality">Modalidade</label>
+            <div class="live-audit-modality-tools">
+              <select id="liveAuditEventModality"><option value="">Todas</option></select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label for="liveAuditEventDate">Data do evento</label>
+            <div class="live-audit-date-wrap">
+              <input id="liveAuditEventDate" type="date" />
+              <button id="liveAuditDatePickerOpen" class="live-audit-calendar-btn" type="button" title="Abrir calendario">📅</button>
+            </div>
+          </div>
+          <div class="form-row"><label for="liveAuditEventTime">Horario do evento — Brasilia</label><input id="liveAuditEventTime" type="time" placeholder="19:00" /></div>
+        </div>
+        <div class="live-audit-stage2-grid-2">
+          <div class="form-row"><label for="liveAuditParticipantA">Participante / Time A</label><input id="liveAuditParticipantA" placeholder="Fluminense" /></div>
+          <div class="form-row"><label for="liveAuditParticipantB">Participante / Time B</label><input id="liveAuditParticipantB" placeholder="Independiente Rivadavia" /></div>
+        </div>
+        <div class="live-audit-actions-bar" style="margin-top: 10px;"><button id="liveAuditSearchEvent" type="button">Buscar evento</button><button id="liveAuditClearEventSearch" type="button">Limpar / Nova busca</button></div>
+        <div id="liveAuditEventCandidates" class="message" style="margin-top: 8px; background: rgba(0, 0, 0, 0.2); padding: 12px; border-radius: 4px;">Nenhum evento selecionado.</div>
+      </div>
+
+      <!-- ETAPA 3: MERCADOS -->
+      <div data-live-audit-workspace="search" class="pref-card" style="border: 2px solid rgba(52, 211, 153, 0.3); padding: 16px; margin-top: 8px;" hidden>
+        <h3 style="color: #34d399; margin-bottom: 12px;">ETAPA 3 — MERCADOS E ISOLAMENTO CANÔNICO</h3>
+        <div class="form-row"><label for="liveAuditMarketSelect">Mercado equivalente</label><select id="liveAuditMarketSelect"><option value="">Selecione um mercado</option></select></div>
+        <div class="actions-row" style="margin-top: 8px;"><button id="liveAuditLoadMarkets" type="button">Carregar mercados</button><button id="liveAuditOpenSourceIntelligence" type="button">Abrir Source Intelligence</button></div>
+        <div id="liveAuditMarketsPanel" class="message" style="max-height:240px; overflow:auto; margin-top: 8px; background: rgba(0, 0, 0, 0.2); padding: 12px; border-radius: 4px;">Mercados não carregados.</div>
+      </div>
+
+      <!-- ETAPA 4: ODDS EM TEMPO REAL -->
+      <div data-live-audit-workspace="search" class="pref-card" style="border: 2px solid rgba(167, 139, 250, 0.3); padding: 16px; margin-top: 8px;" hidden>
+        <h3 style="color: #a78bfa; margin-bottom: 12px;">ETAPA 4 — ODDS EM TEMPO REAL (Read-Only)</h3>
+        <div class="form-row"><label for="liveAuditRefreshSeconds">Intervalo de refresh UI</label><select id="liveAuditRefreshSeconds"><option value="1">1s</option><option value="3" selected>3s</option><option value="5">5s</option><option value="10">10s</option></select></div>
+        <div class="actions-row" style="margin-top: 8px;"><button id="liveAuditStartRealtime" type="button">Iniciar atualização</button><button id="liveAuditStopRealtime" type="button">Parar atualização</button><button id="liveAuditViewRaw" type="button">Ver RAW</button></div>
+        <div id="liveAuditRealtimeMeta" class="message" style="margin-top: 8px; font-size: 12px; color: #999;">Aguardando seleção de mercado.</div>
+        <pre id="liveAuditRealtimeOutput" class="terminal-output" style="margin-top: 8px;">Aguardando atualização em tempo real.</pre>
+      </div>
+
+      <!-- ETAPA 5: AUDITORIA DE ARBITRAGEM -->
+      <div data-live-audit-workspace="arbitrage" class="pref-card" style="border: 2px solid rgba(239, 68, 68, 0.3); padding: 16px; margin-top: 8px;" hidden>
+        <h3 style="color: #ef4444; margin-bottom: 12px;">ETAPA 5 — AUDITORIA DE ARBITRAGEM</h3>
+        <div class="actions-row" style="margin-bottom: 8px;"><button id="liveAuditLoadArbitrage" type="button">Carregar auditoria</button><button id="liveAuditCopyArbitrage" type="button">Copiar auditoria</button><button id="liveAuditExportArbitrage" type="button">Exportar JSON</button></div>
+        <pre id="liveAuditArbitrageOutput" class="terminal-output">Aguardando auditoria de arbitragem.</pre>
+      </div>
+
+      <!-- ETAPA 6: HOMOLOGAÇÃO -->
+      <div data-live-audit-workspace="arbitrage" class="pref-card" style="border: 2px solid rgba(34, 197, 94, 0.3); padding: 16px; margin-top: 8px;" hidden>
+        <h3 style="color: #22c55e; margin-bottom: 12px;">ETAPA 6 — HOMOLOGAÇÃO MANUAL POR CASA</h3>
+        
+        <fieldset style="border: 1px solid rgba(255, 255, 255, 0.1); padding: 12px; border-radius: 4px; margin-bottom: 12px;">
+          <legend style="padding: 0 8px; font-size: 12px; color: #22c55e; font-weight: bold;">Seleção e Status</legend>
+          <div class="form-row"><label for="liveAuditValidationHouse">Casa</label><select id="liveAuditValidationHouse"><option value="">Selecione</option></select></div>
+          <div id="liveAuditValidationStatus" class="message" style="margin-top: 8px; font-size: 12px; background: rgba(0, 0, 0, 0.2); padding: 8px; border-radius: 4px;">Status de homologação não carregado.</div>
+        </fieldset>
+
+        <fieldset style="border: 1px solid rgba(255, 255, 255, 0.1); padding: 12px; border-radius: 4px; margin-bottom: 12px;">
+          <legend style="padding: 0 8px; font-size: 12px; color: #22c55e; font-weight: bold;">Checklist de Validação</legend>
+          <div class="form-row"><label for="liveAuditValidationChecklist">Checklist (JSON)</label><textarea id="liveAuditValidationChecklist" rows="5">{"EVENT_IDENTIFICATION":"PASS","SPORT":"PASS","COMPETITION":"PASS","START_TIME":"PASS","MARKETS":"PASS","PERIODS":"PASS","LINES":"PASS","SELECTIONS":"PASS","BACK":"PASS","LAY":"PASS","LIQUIDITY":"PASS","UPDATE_FREQUENCY":"PASS","RAW_TRACEABILITY":"NOT_TESTED"}</textarea></div>
+          <div class="form-row"><label for="liveAuditValidationNotes">Notas</label><textarea id="liveAuditValidationNotes" rows="3" placeholder="Escopo testado e observações"></textarea></div>
+        </fieldset>
+
+        <fieldset style="border: 1px solid rgba(255, 255, 255, 0.1); padding: 12px; border-radius: 4px; margin-bottom: 12px;">
+          <legend style="padding: 0 8px; font-size: 12px; color: #22c55e; font-weight: bold;">Ações</legend>
+          <div class="actions-row" style="margin-bottom: 8px;">
+            <button id="liveAuditRefreshValidation" type="button">Atualizar status</button>
+            <button id="liveAuditHomologate" type="button">✓ Marcar HOMOLOGATED</button>
+            <button id="liveAuditInvalidate" type="button">✗ Desmarcar homologação</button>
+            <button id="liveAuditSaveAuditRecord" type="button">Salvar auditoria</button>
+          </div>
+          <div class="form-row"><label for="liveAuditInvalidateReason">Motivo da invalidação</label><input id="liveAuditInvalidateReason" placeholder="Reader deixou de capturar LAY" /></div>
+        </fieldset>
+      </div>
+
+      <!-- SEÇÃO AUXILIAR: Históricos e Inconsistências -->
+      <div data-live-audit-workspace="arbitrage" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 8px;" hidden>
+        <div class="pref-card" style="border: 1px solid rgba(255, 255, 255, 0.1); padding: 16px;">
+          <h3 style="font-size: 14px; margin-bottom: 12px;">Reportar Inconsistência</h3>
+          <div class="form-row"><label for="liveAuditIssueType">Tipo</label><select id="liveAuditIssueType"><option value="EVENT">EVENT</option><option value="SPORT">SPORT</option><option value="COMPETITION">COMPETITION</option><option value="TIME">TIME</option><option value="MARKET">MARKET</option><option value="PERIOD">PERIOD</option><option value="LINE">LINE</option><option value="SELECTION">SELECTION</option><option value="BACK">BACK</option><option value="LAY">LAY</option><option value="LIQUIDITY">LIQUIDITY</option><option value="TIMESTAMP">TIMESTAMP</option><option value="LINK">LINK</option><option value="OTHER" selected>OTHER</option></select></div>
+          <div class="form-row"><label for="liveAuditIssueObserved">Valor observado (FALLAH)</label><input id="liveAuditIssueObserved" /></div>
+          <div class="form-row"><label for="liveAuditIssueExpected">Valor esperado</label><input id="liveAuditIssueExpected" /></div>
+          <div class="form-row"><label for="liveAuditIssueNote">Nota</label><textarea id="liveAuditIssueNote" rows="3"></textarea></div>
+          <div class="actions-row" style="margin-top: 8px;"><button id="liveAuditReportIssue" type="button">Reportar inconsistência</button><button id="liveAuditLoadIssues" type="button">Histórico</button></div>
+          <pre id="liveAuditIssueOutput" class="terminal-output" style="margin-top: 8px; font-size: 11px;">Nenhuma inconsistência reportada.</pre>
+        </div>
+
+        <div class="pref-card" style="border: 1px solid rgba(255, 255, 255, 0.1); padding: 16px;">
+          <h3 style="font-size: 14px; margin-bottom: 12px;">Históricos</h3>
+          <div class="actions-row" style="margin-bottom: 8px;">
+            <button id="liveAuditLoadAuditHistory" type="button">Auditorias</button>
+            <button id="liveAuditLoadHomologationHistory" type="button">Homologações</button>
+          </div>
+          <pre id="liveAuditHistoryOutput" class="terminal-output" style="font-size: 11px;">Nenhum histórico carregado.</pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="comparator">
+      <h2>COMPARADOR</h2>
+      <div class="preferences-grid">
+        <div class="pref-card">
+          <div class="form-row"><label for="comparisonType">Tipo</label><select id="comparisonType"><option value="folders">Pastas/Projetos/Builds</option><option value="files">Arquivos</option><option value="zips">ZIPs</option></select></div>
+          <div class="form-row"><label for="comparisonLeft">Origem</label><input id="comparisonLeft" value="C:\FallahAgent" /></div>
+          <div class="form-row"><label for="comparisonRight">Destino</label><input id="comparisonRight" value="C:\FallahAgent" /></div>
+          <button id="runComparison" type="button">Comparar</button>
+        </div>
+        <div class="pref-card"><h3>Resultado</h3><p>Arquivos iguais, diferentes, novos e removidos serão apresentados no relatório.</p></div>
+      </div>
+      <pre id="comparisonResult" class="terminal-output">Aguardando comparação.</pre>
+    </section>
+  </main>
+
+  <footer class="statusbar-global fe-legacy-footer" aria-live="polite">
+    <div><strong>Projeto:</strong> <span id="statusProject">-</span></div>
+    <div><strong>Pasta atual:</strong> <span id="statusCurrentFolder">/</span></div>
+    <div><strong>Arquivos:</strong> <span id="statusFiles">0</span></div>
+    <div><strong>Pastas:</strong> <span id="statusFolders">0</span></div>
+    <div><strong>Servidor:</strong> <span id="statusServer">offline</span></div>
+    <div><strong>Scanner:</strong> <span id="statusScanner">ocioso</span></div>
+    <div><strong>IA:</strong> <span id="statusAi">pronta</span></div>
+    <div><strong>Memória:</strong> <span id="statusMemory">--</span></div>
+    <div><strong>CPU:</strong> <span id="statusCpu">--</span></div>
+    <div><strong>Git:</strong> <span id="statusGit">preparado</span></div>
+    <div><strong>Versão:</strong> <span id="statusVersion">V2.0.0</span></div>
+    <div><strong>Hora:</strong> <span id="statusClock">--:--:--</span></div>
+  </footer>
+
+    </div><!-- /fe-legacy-panel -->
+  </div><!-- /fe-shell -->
+
+  <script src="/vendor/monaco/vs/loader.js"></script>
+  <script>
+    require.config({ paths: { vs: '/vendor/monaco/vs' } });
+    window.MonacoEnvironment = {
+      getWorkerUrl: function () {
+        return 'data:text/javascript;charset=utf-8,' + encodeURIComponent("self.MonacoEnvironment={baseUrl:'/vendor/monaco/'}; importScripts('/vendor/monaco/vs/base/worker/workerMain.js');");
+      }
+    };
+  </script>
+  <script src="app.js"></script>
+  <script src="fallah-engine.js"></script>
+</body>
+</html>
+

@@ -1,0 +1,21 @@
+{
+  "name": "fallahagent",
+  "version": "4.0.0",
+  "description": "FALLAH AGENT modular Node.js dashboard project",
+  "main": "src/desktop/main.js",
+  "author": "FALLAH AGENT",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "archiver": "^8.0.0",
+    "chokidar": "^5.0.0",
+    "dotenv": "^17.4.2",
+    "electron": "^37.10.3",
+    "express": "^5.2.1",
+    "fs-extra": "^11.4.0",
+    "monaco-editor": "^0.50.0",
+    "remixicon": "^4.3.0",
+    "ws": "^8.21.1"
+  }
+}

@@ -1,0 +1,14 @@
+﻿node_modules/
+backups/
+CRASH_LOGS/
+logs/
+temp/
+build/
+
+workspace/
+VERSOES_INSTALADAS/
+*.log
+*.zip
+*.profile.json
+
+config/providers.json

@@ -1,0 +1,737 @@
+/* FALLAH ENGINE — Interface JS
+ * Integra HOME + painel de arbitragem com os endpoints já validados.
+ * NÃO altera readers, normalizer, matching, pipeline ou motor de arbitragem.
+ */
+(function () {
+  'use strict';
+
+  // ── STATE ──────────────────────────────────────────────────────────────
+  const state = {
+    page: 'fe-home',
+    opportunities: [],
+    coverageAudit: null,
+    seenIds: new Set(),
+    houses: [],
+    filters: {
+      type: 'all',      // 2 | 3 | all
+      profitMin: 0.00,
+      ageMaxSec: 60,
+      sport: '',
+      market: '',
+      houses: new Set(),
+      method: 'all',
+    },
+    sound: { muted: false, volume: 0.7, current: 'cash' },
+    autoRefreshMs: 3000,
+    autoTimer: null,
+    startedAt: Date.now(),
+    capital: 100,
+  };
+
+  const SOUND_URLS = {
+    cash: 'data:audio/wav;base64,' + generateTone(880, 0.14, 'square'),
+    coin: 'data:audio/wav;base64,' + generateTone(1200, 0.08, 'sine'),
+    bell: 'data:audio/wav;base64,' + generateTone(880, 0.18, 'triangle'),
+  };
+
+  // generate a minimal inline tone as base64-wav (no copyrighted assets)
+  function generateTone(freq, dur, type) {
+    const sampleRate = 22050, samples = Math.floor(sampleRate * dur);
+    const buf = new ArrayBuffer(44 + samples * 2);
+    const view = new DataView(buf);
+    const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+    writeStr(0, 'RIFF'); view.setUint32(4, 36 + samples * 2, true);
+    writeStr(8, 'WAVE'); writeStr(12, 'fmt '); view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    writeStr(36, 'data'); view.setUint32(40, samples * 2, true);
+    for (let i = 0; i < samples; i++) {
+      const t = i / sampleRate, env = Math.max(0, 1 - t / dur);
+      let s = 0;
+      if (type === 'square') s = Math.sin(2 * Math.PI * freq * t) > 0 ? 1 : -1;
+      else if (type === 'triangle') s = (2 / Math.PI) * Math.asin(Math.sin(2 * Math.PI * freq * t));
+      else s = Math.sin(2 * Math.PI * freq * t);
+      view.setInt16(44 + i * 2, Math.round(s * env * 16000), true);
+    }
+    const bytes = new Uint8Array(buf);
+    let b64 = '';
+    const chunkSz = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSz) b64 += btoa(String.fromCharCode(...bytes.subarray(i, i + chunkSz)));
+    return b64;
+  }
+
+  // ── NAVIGATION ────────────────────────────────────────────────────────
+  function navigate(pageId) {
+    document.querySelectorAll('.fe-page').forEach((p) => p.classList.remove('active'));
+    const target = document.getElementById(pageId);
+    if (target) { target.classList.add('active'); state.page = pageId; }
+  }
+
+  // delegate nav buttons
+  document.addEventListener('click', (e) => {
+    const nav = e.target.closest('[data-nav]');
+    if (!nav) return;
+    const target = nav.dataset.nav;
+    // if it's a legacy tab, show legacy panel instead
+    if (!target.startsWith('fe-')) {
+      openLegacy(target);
+    } else {
+      navigate(target);
+    }
+  });
+
+  // ── LEGACY PANEL ──────────────────────────────────────────────────────
+  function openLegacy(tab) {
+    const panel = document.getElementById('fe-legacy-panel');
+    if (!panel) return;
+    panel.hidden = false;
+    // activate the correct legacy tab
+    if (tab) {
+      const btn = document.querySelector(`nav button[data-tab="${tab}"]`);
+      if (btn) btn.click();
+    }
+  }
+
+  const legacyToggleBtn = document.getElementById('fe-legacy-toggle');
+  if (legacyToggleBtn) legacyToggleBtn.addEventListener('click', () => openLegacy('dashboard'));
+
+  const legacyCloseBtn = document.getElementById('fe-legacy-close');
+  if (legacyCloseBtn) legacyCloseBtn.addEventListener('click', () => {
+    const panel = document.getElementById('fe-legacy-panel');
+    if (panel) panel.hidden = true;
+  });
+
+  // secondary nav
+  document.getElementById('fe-sec-diagnostico')?.addEventListener('click', () => openLegacy('dashboard'));
+  document.getElementById('fe-sec-backup')?.addEventListener('click', () => openLegacy('backup-manager'));
+  document.getElementById('fe-coverage-details')?.addEventListener('click', () => openLegacy('dashboard'));
+
+  // ── CLOCK ─────────────────────────────────────────────────────────────
+  function updateClock() {
+    const now = new Date();
+    const ts = now.toLocaleTimeString('pt-BR');
+    const ds = now.toLocaleDateString('pt-BR', { weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const clockEl = document.getElementById('fe-clock-time');
+    const dateEl = document.getElementById('fe-clock-date');
+    const arbClock = document.getElementById('fe-arb-clock');
+    if (clockEl) clockEl.textContent = ts;
+    if (dateEl) dateEl.textContent = ds;
+    if (arbClock) arbClock.textContent = ts;
+    // uptime
+    const elapsed = Math.floor((Date.now() - state.startedAt) / 1000);
+    const h = String(Math.floor(elapsed / 3600)).padStart(2, '0');
+    const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    const uptimeEl = document.getElementById('fe-uptime');
+    if (uptimeEl) uptimeEl.textContent = `${h}:${m}:${s}`;
+  }
+  setInterval(updateClock, 1000);
+  updateClock();
+
+  // ── PIPELINE STATUS ────────────────────────────────────────────────────
+  async function loadPipelineStatus() {
+    try {
+      const res = await fetch('/api/pipeline/status');
+      const json = await res.json();
+      if (!json.success) return;
+      const pipeline = json.pipeline || {};
+      const readers = pipeline.readers || [];
+
+      // houses
+      const houseMap = new Map();
+      for (const r of readers) {
+        if (!r.houseId) continue;
+        const key = r.houseId;
+        if (!houseMap.has(key)) {
+          houseMap.set(key, {
+            id: r.houseId,
+            name: r.houseName || r.houseId,
+            active: Boolean(r.active),
+            online: r.runtime?.status === 'connected' || r.runtime?.status === 'running',
+            cycles: r.runtime?.cycles || 0,
+          });
+        }
+      }
+      state.houses = [...houseMap.values()];
+
+      // init selected houses
+      if (state.filters.houses.size === 0) {
+        for (const h of state.houses) state.filters.houses.add(h.id);
+      }
+
+      renderHousePills();
+      renderHouseFilters();
+
+      const onlineCount = state.houses.filter((h) => h.online).length;
+      const countEl = document.getElementById('fe-houses-count');
+      if (countEl) countEl.textContent = onlineCount;
+
+      const statusDot = document.getElementById('fe-status-dot');
+      const statusLabel = document.getElementById('fe-system-status');
+      const statusLabelText = document.getElementById('fe-status-label');
+      if (onlineCount > 0) {
+        statusDot?.classList.remove('offline');
+        if (statusLabelText) statusLabelText.textContent = 'SISTEMA ONLINE';
+        if (statusLabel) statusLabel.style.background = '#1a2e1f';
+      } else {
+        if (statusLabelText) statusLabelText.textContent = 'SISTEMA OFFLINE';
+        if (statusLabel) statusLabel.style.background = '#2d1a1a';
+      }
+
+      const enginesEl = document.getElementById('fe-engines-active');
+      if (enginesEl) enginesEl.textContent = `${onlineCount} / ${state.houses.length}`;
+
+      // LPS estimate
+      const lpsEl = document.getElementById('fe-lps');
+      if (lpsEl) {
+        const total = state.houses.filter((h) => h.online).length;
+        lpsEl.textContent = total > 0 ? (total * 0.2).toFixed(3) : '0';
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function loadCoverageAudit() {
+    try {
+      const res = await fetch('/api/pipeline/coverage/audit');
+      const json = await res.json();
+      if (!json?.success || !json?.audit) return;
+      state.coverageAudit = json.audit;
+      renderCoverageAudit();
+    } catch {
+      // ignore
+    }
+  }
+
+  function renderCoverageAudit() {
+    const grid = document.getElementById('fe-coverage-grid');
+    const stamp = document.getElementById('fe-coverage-stamp');
+    if (!grid) return;
+
+    const audit = state.coverageAudit;
+    if (!audit?.houses) {
+      grid.innerHTML = '<div class="fe-coverage-empty">Cobertura indisponível no momento.</div>';
+      return;
+    }
+
+    const houses = Object.entries(audit.houses);
+    if (houses.length === 0) {
+      grid.innerHTML = '<div class="fe-coverage-empty">Nenhuma casa encontrada na auditoria.</div>';
+      return;
+    }
+
+    const rows = houses.map(([houseName, house]) => {
+      const valid = Number(house.eventosValidos || 0);
+      const markets = Number(house.mercados || 0);
+      const selections = Number(house.selecoes || 0);
+      const odds = Number(house.oddsValidas || 0);
+      const live = Number(house.live || 0);
+      const prematch = Number(house.prematch || 0);
+      const received = house.eventosRecebidos === 'TOTAL_DA_FONTE_NAO_DETERMINAVEL'
+        ? 'N/D'
+        : Number(house.eventosRecebidos || 0);
+      const back = Number(house.backValidos || 0);
+      const lay = Number(house.layValidos || 0);
+      const updatedAt = String(house?.freshness?.lastOperationalUpdate || '');
+      const ageMs = Number(house?.freshness?.operationalAgeMs || 0);
+      const ageSec = Number.isFinite(ageMs) ? Math.max(0, Math.floor(ageMs / 1000)) : null;
+      const ageText = ageSec === null ? '-' : (ageSec < 60 ? `${ageSec}s` : `${Math.floor(ageSec / 60)}m`);
+      const updatedText = updatedAt ? new Date(updatedAt).toLocaleTimeString('pt-BR') : '-';
+      const collectionStatus = house?.paginacao?.coletaParcialDetectada
+        ? 'PARCIAL'
+        : (house.eventosRecebidos === 'TOTAL_DA_FONTE_NAO_DETERMINAVEL' ? 'NAO_DETERMINAVEL' : 'COMPLETA');
+
+      let status = 'OFFLINE';
+      let statusClass = 'red';
+      if (house.readerActive && house.dadoFresco) {
+        status = 'FRESCO';
+        statusClass = 'green';
+      } else if (house.readerActive) {
+        status = 'PARCIAL';
+        statusClass = 'yellow';
+      }
+
+      return `<div class="fe-coverage-row">
+        <div class="name">${escHtml(houseName)}</div>
+        <div class="status ${statusClass}">${status}</div>
+        <div>Up: ${updatedText}</div>
+        <div>Age: ${ageText}</div>
+        <div>Ev: ${received}/${valid}</div>
+        <div>Mkt: ${markets}</div>
+        <div>Sel: ${selections}</div>
+        <div>Odds: ${odds}</div>
+        <div>B/L: ${back}/${lay}</div>
+        <div>L/P: ${live}/${prematch}</div>
+        <div>Col: ${collectionStatus}</div>
+      </div>`;
+    }).join('');
+
+    grid.innerHTML = rows;
+    if (stamp) {
+      const ts = audit.generatedAt ? new Date(audit.generatedAt) : new Date();
+      const totalValid = Number(audit?.totals?.totalEventosValidos || 0);
+      stamp.textContent = `Atualizado ${ts.toLocaleTimeString('pt-BR')} · Eventos válidos: ${totalValid}`;
+    }
+  }
+
+  function renderHousePills() {
+    const pillsEl = document.getElementById('fe-houses-pills');
+    const arbBar = document.getElementById('fe-arb-houses-bar');
+    if (!pillsEl) return;
+    const pillsHtml = state.houses.map((h) =>
+      `<span class="fe-house-pill ${h.online ? 'online' : ''}">${h.name}</span>`
+    ).join('');
+    pillsEl.innerHTML = pillsHtml;
+    if (arbBar) arbBar.innerHTML = pillsHtml;
+  }
+
+  function renderHouseFilters() {
+    const listEl = document.getElementById('fe-filter-houses-list');
+    if (!listEl) return;
+    listEl.innerHTML = state.houses.map((h) =>
+      `<label class="fe-house-filter-row">
+        <input type="checkbox" data-house="${h.id}" ${state.filters.houses.has(h.id) ? 'checked' : ''} />
+        <span>${h.name}</span>
+        <span class="fe-house-pill ${h.online ? 'online' : ''}" style="margin-left:auto">${h.online ? '●' : '○'}</span>
+      </label>`
+    ).join('');
+    listEl.querySelectorAll('input[data-house]').forEach((cb) => {
+      cb.addEventListener('change', (e) => {
+        const id = e.target.dataset.house;
+        if (e.target.checked) state.filters.houses.add(id);
+        else state.filters.houses.delete(id);
+        applyFiltersAndRender();
+      });
+    });
+  }
+
+  // ── ENGINE STATUS + OPPORTUNITIES ─────────────────────────────────────
+  async function loadEngineStatus() {
+    try {
+      const res = await fetch('/api/arbitrage-engine/status');
+      const json = await res.json();
+      if (!json.success) return;
+      const engine = json.engine || {};
+      const opps = engine.opportunities || [];
+      const newOnes = [];
+
+      for (const op of opps) {
+        if (!state.seenIds.has(op.id)) {
+          state.seenIds.add(op.id);
+          newOnes.push(op);
+        }
+      }
+
+      state.opportunities = opps;
+
+      if (newOnes.length > 0) playAlert();
+
+      const lastUpdateEl = document.getElementById('fe-arb-last-update');
+      if (lastUpdateEl) lastUpdateEl.textContent = new Date().toLocaleTimeString('pt-BR');
+
+      const marketsEl = document.getElementById('fe-arb-markets');
+      if (marketsEl) {
+        const stats = engine.stats || {};
+        marketsEl.textContent = stats.generated !== undefined ? stats.generated : opps.length;
+      }
+
+      applyFiltersAndRender();
+    } catch {
+      // ignore
+    }
+  }
+
+  function applyFiltersAndRender() {
+    let opps = state.opportunities.slice();
+    const now = Date.now();
+
+    // filter by house
+    if (state.filters.houses.size > 0 && state.filters.houses.size < state.houses.length) {
+      opps = opps.filter((op) =>
+        (op.legs || []).some((leg) => state.filters.houses.has(String(leg.houseId)))
+      );
+    }
+
+    // filter by type (2 / 3 houses)
+    if (state.filters.type !== 'all') {
+      const count = Number(state.filters.type);
+      opps = opps.filter((op) => new Set((op.legs || []).map((l) => l.houseId)).size === count);
+    }
+
+    // filter profit
+    opps = opps.filter((op) => Number(op.arbitragePercent || 0) >= state.filters.profitMin);
+
+    // filter age
+    opps = opps.filter((op) => {
+      const ts = Date.parse(op.detectedAt || '');
+      if (!Number.isFinite(ts)) return true;
+      return (now - ts) / 1000 <= state.filters.ageMaxSec;
+    });
+
+    // filter sport
+    if (state.filters.sport) opps = opps.filter((op) => (op.sport || '').toLowerCase() === state.filters.sport.toLowerCase());
+
+    // filter market
+    if (state.filters.market) opps = opps.filter((op) => String(op.market || '').startsWith(state.filters.market));
+
+    // sort by profit desc
+    opps.sort((a, b) => Number(b.arbitragePercent || 0) - Number(a.arbitragePercent || 0));
+
+    // update home counter
+    const arbCountEl = document.getElementById('fe-arb-count');
+    if (arbCountEl) arbCountEl.textContent = opps.length;
+
+    renderOpportunities(opps);
+  }
+
+  function renderOpportunities(opps) {
+    const listEl = document.getElementById('fe-arb-list');
+    if (!listEl) return;
+
+    const countEl = document.getElementById('fe-arb-opp-count');
+    const bestEl = document.getElementById('fe-arb-best-profit');
+    const avgEl = document.getElementById('fe-arb-avg-profit');
+    const badgeEl = document.getElementById('fe-arb-badge');
+    const topBadgeEl = document.getElementById('fe-alerts-badge');
+
+    if (countEl) countEl.textContent = opps.length;
+    if (opps.length > 0) {
+      const profits = opps.map((o) => Number(o.arbitragePercent || 0));
+      if (bestEl) bestEl.textContent = Math.max(...profits).toFixed(2) + '%';
+      if (avgEl) avgEl.textContent = (profits.reduce((a, b) => a + b, 0) / profits.length).toFixed(2) + '%';
+      if (badgeEl) { badgeEl.textContent = opps.length; badgeEl.hidden = false; }
+      if (topBadgeEl) { topBadgeEl.textContent = opps.length; topBadgeEl.hidden = false; }
+    } else {
+      if (bestEl) bestEl.textContent = '0%';
+      if (avgEl) avgEl.textContent = '0%';
+      if (badgeEl) badgeEl.hidden = true;
+      if (topBadgeEl) topBadgeEl.hidden = true;
+    }
+
+    if (opps.length === 0) {
+      listEl.innerHTML = `<div class="fe-arb-empty" id="fe-arb-empty">
+        <i class="ri-search-eye-line"></i>
+        <p>NENHUMA ARBITRAGEM DISPONÍVEL NO MOMENTO</p>
+        <small>Monitorando dados reais em tempo real...</small>
+      </div>`;
+      return;
+    }
+
+    const rows = opps.map((op) => {
+      const profit = Number(op.arbitragePercent || 0).toFixed(2);
+      const houses = [...new Set((op.legs || []).map((l) => l.houseId))];
+      const houseCount = houses.size || houses.length;
+      const eventName = (op.event?.participants || []).join(' vs ') || (op.event?.key || '').replace(/\|/g, ' vs ');
+      const market = String(op.market || '').split('|')[0];
+      const age = op.detectedAt ? Math.floor((Date.now() - Date.parse(op.detectedAt)) / 1000) : null;
+      const ageStr = age !== null ? (age < 60 ? `${age}s atrás` : `${Math.floor(age / 60)}m atrás`) : '-';
+      const netMoney = op.netProfit != null ? `R$ ${Number(op.netProfit).toFixed(2)}` : '';
+
+      const housesHtml = (op.legs || []).map((leg) => {
+        const hName = getHouseName(leg.houseId);
+        const side = String(leg.type || '').toUpperCase();
+        const sideClass = side === 'LAY' ? 'fe-opp-side-lay' : 'fe-opp-side-back';
+        return `<div class="fe-opp-house-line">
+          <span class="fe-opp-house-name">${escHtml(hName)}</span>
+          <span class="${sideClass}">${side}</span>
+        </div>`;
+      }).join('');
+
+      const oddsHtml = (op.legs || []).map((leg) => `<span>${Number(leg.odd || 0).toFixed(2)}</span>`).join('');
+
+      const openUrl = (op.legs || []).find((l) => l.url)?.url;
+      const openBtn = openUrl
+        ? `<button class="fe-opp-open" onclick="window.open('${escHtml(openUrl)}','_blank')">ABRIR <i class='ri-external-link-line'></i></button>`
+        : `<button class="fe-opp-open" onclick="feOpenCalc('${escHtml(op.id)}')">ABRIR <i class='ri-calculator-line'></i></button>`;
+
+      return `<div class="fe-arb-row" onclick="feOpenCalc('${escHtml(op.id)}')" data-opp-id="${escHtml(op.id)}">
+        <div><div class="fe-opp-profit">${profit}%</div><div class="fe-opp-profit-money">${netMoney}</div><div class="fe-opp-profit-houses">${houseCount} CASAS</div></div>
+        <div class="fe-opp-event">
+          <span class="fe-opp-event-name">${escHtml(eventName)}</span>
+          <span class="fe-opp-event-comp">${escHtml(op.sport || '')}</span>
+          <span class="fe-opp-event-time">${escHtml(op.event?.startTime || '')}</span>
+        </div>
+        <div class="fe-opp-market">${escHtml(market)}</div>
+        <div class="fe-opp-sel">${escHtml((op.legs || [])[0]?.selection || '-')}</div>
+        <div class="fe-opp-houses">${housesHtml}</div>
+        <div class="fe-opp-odds">${oddsHtml}</div>
+        <div class="fe-opp-profit-cell">${profit}%</div>
+        <div class="fe-opp-age">${ageStr}</div>
+        <div onclick="event.stopPropagation()">${openBtn}</div>
+      </div>`;
+    }).join('');
+
+    listEl.innerHTML = rows;
+  }
+
+  function getHouseName(houseId) {
+    const h = state.houses.find((x) => x.id === String(houseId || ''));
+    return h ? h.name : String(houseId || '').substring(0, 8);
+  }
+
+  function escHtml(str) {
+    return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── CALCULATOR ─────────────────────────────────────────────────────────
+  window.feOpenCalc = function (oppId) {
+    const op = state.opportunities.find((o) => o.id === oppId);
+    if (!op) return;
+    renderCalc(op);
+    document.getElementById('fe-calc-modal').hidden = false;
+  };
+
+  document.getElementById('fe-calc-close')?.addEventListener('click', () => {
+    document.getElementById('fe-calc-modal').hidden = true;
+  });
+
+  function renderCalc(op) {
+    const body = document.getElementById('fe-calc-body');
+    if (!body) return;
+    const eventName = (op.event?.participants || []).join(' vs ') || String(op.event?.key || '').replace(/\|/g, ' vs ');
+    const market = String(op.market || '').split('|')[0];
+    const bankroll = state.capital;
+
+    const calcLegs = (op.legs || []).map((leg) => {
+      const rate = Number(leg.commissionRate || 0);
+      const odd = Number(leg.odd || 0);
+      const effectiveOdd = 1 + ((odd - 1) * (1 - rate / 100));
+      return { ...leg, effectiveOdd, odd, rate };
+    });
+
+    // implied probability for BACK
+    const implied = calcLegs.reduce((sum, l) => sum + (l.effectiveOdd > 0 ? 1 / l.effectiveOdd : 0), 0);
+    const legsWithStake = calcLegs.map((l) => ({
+      ...l,
+      stake: implied > 0 ? bankroll * ((1 / l.effectiveOdd) / implied) : 0,
+    }));
+
+    const payout = implied > 0 ? bankroll / implied : 0;
+    const grossProfit = Number(op.grossProfit || (payout - bankroll));
+    const netProfit = Number(op.netProfit || grossProfit);
+    const profitPct = Number(op.arbitragePercent || 0).toFixed(2);
+    const totalComm = legsWithStake.reduce((s, l) => s + l.stake * (l.rate / 100), 0);
+    const expired = op.legs?.some((l) => !Number.isFinite(Number(l.odd)) || Number(l.odd) <= 1);
+
+    const legsHtml = legsWithStake.map((leg) => {
+      const hName = getHouseName(leg.houseId);
+      const side = String(leg.type || '').toUpperCase();
+      const liability = side === 'LAY' ? (leg.stake * (leg.odd - 1)).toFixed(2) : '-';
+      return `<div class="fe-calc-leg">
+        <div><div class="fe-calc-leg-label">CASA</div><div class="fe-calc-leg-val">${escHtml(hName)}</div><div class="fe-calc-leg-label">MERCADO</div><div class="fe-calc-leg-val">${escHtml(leg.selection || '-')}</div></div>
+        <div><div class="fe-calc-leg-label">LADO</div><div class="fe-calc-leg-val">${side}</div><div class="fe-calc-leg-label">ODD</div><div class="fe-calc-leg-val">${Number(leg.odd).toFixed(3)}</div></div>
+        <div><div class="fe-calc-leg-label">STAKE</div><div class="fe-calc-leg-val">R$ ${leg.stake.toFixed(2)}</div><div class="fe-calc-leg-label">RESPONSAB.</div><div class="fe-calc-leg-val">${liability === '-' ? '-' : 'R$ ' + liability}</div></div>
+        <div><div class="fe-calc-leg-label">COMISSÃO</div><div class="fe-calc-leg-val">${Number(leg.rate).toFixed(2)}%</div><div class="fe-calc-leg-label">ODD EFETIVA</div><div class="fe-calc-leg-val">${Number(leg.effectiveOdd).toFixed(4)}</div></div>
+      </div>`;
+    }).join('');
+
+    body.innerHTML = `
+      ${expired ? '<div class="fe-calc-expired"><i class="ri-alert-line"></i> OPORTUNIDADE EXPIRADA — ODDS ALTERADAS</div>' : ''}
+      <div class="fe-calc-event-info">
+        <strong>${escHtml(eventName)}</strong><br>
+        ${escHtml(op.sport || '')} · ${escHtml(market)}<br>
+        Detectado: ${escHtml(op.detectedAt || '-')}
+      </div>
+      <div class="fe-calc-capital-row">
+        <label>CAPITAL TOTAL (R$)</label>
+        <input type="number" id="fe-calc-capital" min="0.01" step="0.01" value="${bankroll}" />
+        <button style="background:var(--fe-accent);color:#111;border:none;border-radius:6px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer" onclick="feRecalc('${escHtml(op.id)}')">RECALCULAR</button>
+      </div>
+      <div class="fe-calc-legs">${legsHtml}</div>
+      <div class="fe-calc-summary">
+        <div class="fe-calc-sum-item"><div class="fe-calc-sum-label">LUCRO BRUTO</div><div class="fe-calc-sum-val green">R$ ${grossProfit.toFixed(2)}</div></div>
+        <div class="fe-calc-sum-item"><div class="fe-calc-sum-label">COMISSÕES</div><div class="fe-calc-sum-val red">-R$ ${totalComm.toFixed(2)}</div></div>
+        <div class="fe-calc-sum-item"><div class="fe-calc-sum-label">LUCRO LÍQUIDO</div><div class="fe-calc-sum-val ${netProfit >= 0 ? 'green' : 'red'}">R$ ${netProfit.toFixed(2)} (${profitPct}%)</div></div>
+      </div>
+      <div class="fe-calc-actions">
+        <button style="background:none;border:1px solid var(--fe-border);color:var(--fe-text3);border-radius:6px;padding:8px 16px;font-size:12px;cursor:pointer" onclick="document.getElementById('fe-calc-modal').hidden=true">FECHAR</button>
+        <button style="background:var(--fe-bg3);border:1px solid var(--fe-border);color:var(--fe-text2);border-radius:6px;padding:8px 16px;font-size:12px;cursor:pointer;margin-left:auto" disabled title="Execução financeira real bloqueada nesta versão"><i class="ri-lock-line"></i> EXECUTAR — BLOQUEADO (SEGURANÇA)</button>
+      </div>
+    `;
+  }
+
+  window.feRecalc = function (oppId) {
+    const capInput = document.getElementById('fe-calc-capital');
+    if (capInput) state.capital = Math.max(0.01, Number(capInput.value) || 0.01);
+    const op = state.opportunities.find((o) => o.id === oppId);
+    if (op) renderCalc(op);
+  };
+
+  // ── SOUND ─────────────────────────────────────────────────────────────
+  function playAlert() {
+    if (state.sound.muted) return;
+    try {
+      const key = state.sound.current;
+      const dataUrl = SOUND_URLS[key] || SOUND_URLS.cash;
+      const audio = new Audio(dataUrl);
+      audio.volume = state.sound.volume;
+      audio.play().catch(() => {});
+    } catch {
+      // ignore
+    }
+  }
+
+  document.getElementById('fe-sound-mute')?.addEventListener('change', (e) => {
+    state.sound.muted = e.target.checked;
+  });
+
+  document.getElementById('fe-sound-volume')?.addEventListener('input', (e) => {
+    state.sound.volume = Number(e.target.value) / 100;
+    const valEl = document.getElementById('fe-sound-volume-val');
+    if (valEl) valEl.textContent = e.target.value + '%';
+  });
+
+  document.getElementById('fe-sound-select')?.addEventListener('change', (e) => {
+    state.sound.current = e.target.value;
+    const nameEl = document.getElementById('fe-arb-sound-name');
+    if (nameEl) nameEl.textContent = e.target.options[e.target.selectedIndex]?.text || '';
+  });
+
+  document.getElementById('fe-sound-test')?.addEventListener('click', () => {
+    const was = state.sound.muted;
+    state.sound.muted = false;
+    playAlert();
+    state.sound.muted = was;
+  });
+
+  document.getElementById('fe-arb-sound-btn')?.addEventListener('click', () => {
+    const cb = document.getElementById('fe-sound-mute');
+    if (cb) { cb.checked = !cb.checked; state.sound.muted = cb.checked; }
+  });
+
+  // ── FILTERS WIRING ────────────────────────────────────────────────────
+  document.querySelectorAll('#fe-arb-type-filter .fe-pill').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#fe-arb-type-filter .fe-pill').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.filters.type = btn.dataset.value;
+      applyFiltersAndRender();
+    });
+  });
+
+  document.getElementById('fe-filter-profit-min')?.addEventListener('input', (e) => {
+    state.filters.profitMin = Number(e.target.value);
+    const valEl = document.getElementById('fe-filter-profit-min-val');
+    if (valEl) valEl.textContent = Number(e.target.value).toFixed(2) + ' %';
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-filter-age-max')?.addEventListener('input', (e) => {
+    state.filters.ageMaxSec = Number(e.target.value);
+    const valEl = document.getElementById('fe-filter-age-max-val');
+    if (valEl) valEl.textContent = e.target.value + ' s';
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-filter-sport')?.addEventListener('change', (e) => {
+    state.filters.sport = e.target.value;
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-filter-market')?.addEventListener('change', (e) => {
+    state.filters.market = e.target.value;
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-filter-method')?.addEventListener('change', (e) => {
+    state.filters.method = e.target.value;
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-houses-all')?.addEventListener('click', () => {
+    state.filters.houses = new Set(state.houses.map((h) => h.id));
+    renderHouseFilters();
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-houses-none')?.addEventListener('click', () => {
+    state.filters.houses.clear();
+    renderHouseFilters();
+    applyFiltersAndRender();
+  });
+
+  document.getElementById('fe-filter-clear')?.addEventListener('click', () => {
+    state.filters.type = 'all';
+    state.filters.profitMin = 0;
+    state.filters.ageMaxSec = 60;
+    state.filters.sport = '';
+    state.filters.market = '';
+    state.filters.method = 'all';
+    state.filters.houses = new Set(state.houses.map((h) => h.id));
+    document.getElementById('fe-filter-profit-min').value = 0;
+    document.getElementById('fe-filter-profit-min-val').textContent = '0.00 %';
+    document.getElementById('fe-filter-age-max').value = 60;
+    document.getElementById('fe-filter-age-max-val').textContent = '60 s';
+    document.getElementById('fe-filter-sport').value = '';
+    document.getElementById('fe-filter-market').value = '';
+    document.getElementById('fe-filter-method').value = 'all';
+    document.querySelectorAll('#fe-arb-type-filter .fe-pill').forEach((b) => b.classList.remove('active'));
+    document.querySelector('#fe-arb-type-filter .fe-pill[data-value="all"]')?.classList.add('active');
+    renderHouseFilters();
+    applyFiltersAndRender();
+  });
+
+  // ── AUTO REFRESH ──────────────────────────────────────────────────────
+  function startAutoRefresh() {
+    if (state.autoTimer) clearInterval(state.autoTimer);
+    state.autoTimer = setInterval(async () => {
+      await loadPipelineStatus();
+      await loadEngineStatus();
+      await loadCoverageAudit();
+    }, state.autoRefreshMs);
+  }
+
+  document.getElementById('fe-arb-refresh-btn')?.addEventListener('click', async () => {
+    await loadPipelineStatus();
+    await loadEngineStatus();
+    await loadCoverageAudit();
+  });
+
+  document.getElementById('fe-arb-refresh-now')?.addEventListener('click', async () => {
+    await loadPipelineStatus();
+    await loadEngineStatus();
+    await loadCoverageAudit();
+  });
+
+  document.getElementById('fe-arb-export')?.addEventListener('click', () => {
+    const data = JSON.stringify(state.opportunities, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `fallah-arbitrage-${Date.now()}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+
+  document.getElementById('fe-arb-auto-btn')?.addEventListener('click', () => {
+    // mode toggle — execution stays blocked, just a UI note
+    const lbl = document.getElementById('fe-arb-auto-label');
+    if (!lbl) return;
+    if (lbl.textContent === 'INATIVO') {
+      lbl.textContent = 'ATIVO';
+      document.getElementById('fe-arb-auto-btn').style.background = 'rgba(0,230,118,.15)';
+    } else {
+      lbl.textContent = 'INATIVO';
+      document.getElementById('fe-arb-auto-btn').style.background = '';
+    }
+  });
+
+  // ── BUILD / FOOTER ─────────────────────────────────────────────────────
+  const buildEl = document.getElementById('fe-footer-build');
+  if (buildEl) {
+    const d = new Date();
+    buildEl.textContent = `BUILD ${d.getFullYear()}.${String(d.getMonth()+1).padStart(2,'0')}.${String(d.getDate()).padStart(2,'0')}`;
+  }
+
+  // ── INIT ──────────────────────────────────────────────────────────────
+  async function init() {
+    await loadPipelineStatus();
+    await loadEngineStatus();
+    await loadCoverageAudit();
+    startAutoRefresh();
+  }
+
+  init();
+})();

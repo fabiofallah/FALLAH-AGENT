@@ -1,0 +1,252 @@
+/* FALLAH ENGINE — PREMIUM WHITE HIGH CONTRAST
+   SOMENTE VISUAL: texto/bordas/divisórias. Não altera layout, JS ou lógica.
+   Deve ser carregado por ÚLTIMO.
+*/
+
+/* Branco literal para textos do painel */
+body,
+body p,
+body small,
+body label,
+body th,
+body td,
+body span,
+body a,
+body select,
+body option,
+body button,
+body input,
+body div {
+  --fallah-white: #FFFFFF;
+  --fallah-border: #FFFFFF;
+}
+
+/* Textos comuns e operacionais */
+.fe-arbitrage-view p,
+.fe-arbitrage-view small,
+.fe-arbitrage-view label,
+.fe-arbitrage-view th,
+.fe-arbitrage-view td,
+.fe-arbitrage-view select,
+.fe-arbitrage-view option,
+.fe-arbitrage-view button,
+.fe-arbitrage-view [class*="title"],
+.fe-arbitrage-view [class*="label"],
+.fe-arbitrage-view [class*="header"],
+.fe-arbitrage-view [class*="desc"],
+.fe-arbitrage-view [class*="caption"],
+.fe-arbitrage-view [class*="empty"],
+.fe-arbitrage-view [class*="filter"],
+.fe-arbitrage-view [class*="house"],
+.fe-arbitrage-view [class*="market"],
+.fe-arbitrage-view [class*="sport"],
+.fe-arbitrage-view [class*="toolbar"],
+.fe-arb-page p,
+.fe-arb-page small,
+.fe-arb-page label,
+.fe-arb-page th,
+.fe-arb-page td,
+.fe-arb-page select,
+.fe-arb-page option,
+.fe-arb-page button,
+.fe-arb-page [class*="title"],
+.fe-arb-page [class*="label"],
+.fe-arb-page [class*="header"],
+.fe-arb-page [class*="desc"],
+.fe-arb-page [class*="caption"],
+.fe-arb-page [class*="empty"],
+.fe-arb-page [class*="filter"],
+.fe-arb-page [class*="house"],
+.fe-arb-page [class*="market"],
+.fe-arb-page [class*="sport"],
+.fe-arb-page [class*="toolbar"] {
+  color: #FFFFFF !important;
+  opacity: 1 !important;
+}
+
+/* Regra ampla para a tela de arbitragem, sem recolorir fundos */
+body.fe-arbitrage-view,
+body.fe-arb-page {
+  color: #FFFFFF !important;
+}
+
+.fe-coverage-card {
+  margin-top: 14px;
+  border: 1px solid var(--fe-border);
+  background: linear-gradient(180deg, #0f1418 0%, #0b1014 100%);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.fe-coverage-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.fe-coverage-head h3 {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: .08em;
+}
+
+.fe-coverage-head p {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--fe-text2);
+}
+
+.fe-coverage-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.fe-coverage-row {
+  display: grid;
+  grid-template-columns: 1.2fr .7fr .8fr .7fr .8fr .7fr .7fr .7fr .7fr .8fr;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  border: 1px solid var(--fe-border);
+  border-radius: 8px;
+  padding: 8px;
+  background: #0d1217;
+}
+
+.fe-coverage-row .name { font-weight: 700; color: var(--fe-text); }
+.fe-coverage-row .status { font-weight: 700; }
+.fe-coverage-row .status.green { color: var(--fe-green); }
+.fe-coverage-row .status.yellow { color: #ffcc4d; }
+.fe-coverage-row .status.red { color: #ff6b6b; }
+.fe-coverage-empty { font-size: 12px; color: var(--fe-text2); padding: 6px 2px; }
+
+@media (max-width: 1100px) {
+  .fe-coverage-row {
+    grid-template-columns: 1fr 1fr;
+    row-gap: 4px;
+  }
+}
+
+/* Cabeçalhos e títulos: branco forte */
+.fe-arbitrage-view h1,
+.fe-arbitrage-view h2,
+.fe-arbitrage-view h3,
+.fe-arbitrage-view h4,
+.fe-arbitrage-view h5,
+.fe-arbitrage-view h6,
+.fe-arb-page h1,
+.fe-arb-page h2,
+.fe-arb-page h3,
+.fe-arb-page h4,
+.fe-arb-page h5,
+.fe-arb-page h6 {
+  color: #FFFFFF !important;
+  opacity: 1 !important;
+}
+
+/* Bordas dos controles */
+.fe-arbitrage-view button,
+.fe-arbitrage-view select,
+.fe-arbitrage-view input:not([type="range"]),
+.fe-arb-page button,
+.fe-arb-page select,
+.fe-arb-page input:not([type="range"]) {
+  border: 2px solid #FFFFFF !important;
+  opacity: 1 !important;
+}
+
+/* Painéis, cards, filtros e blocos: bordas brancas premium */
+.fe-arbitrage-view [class*="panel"],
+.fe-arbitrage-view [class*="card"],
+.fe-arbitrage-view [class*="metric"],
+.fe-arbitrage-view [class*="stat"],
+.fe-arbitrage-view [class*="sidebar"],
+.fe-arbitrage-view [class*="filter"],
+.fe-arbitrage-view [class*="toolbar"],
+.fe-arbitrage-view [class*="table"],
+.fe-arbitrage-view [class*="section"],
+.fe-arb-page [class*="panel"],
+.fe-arb-page [class*="card"],
+.fe-arb-page [class*="metric"],
+.fe-arb-page [class*="stat"],
+.fe-arb-page [class*="sidebar"],
+.fe-arb-page [class*="filter"],
+.fe-arb-page [class*="toolbar"],
+.fe-arb-page [class*="table"],
+.fe-arb-page [class*="section"] {
+  border-color: #FFFFFF !important;
+}
+
+/* Tabela: linhas realmente brancas */
+.fe-arbitrage-view table,
+.fe-arb-page table {
+  border-collapse: collapse;
+  border-color: #FFFFFF !important;
+}
+
+.fe-arbitrage-view thead,
+.fe-arbitrage-view thead tr,
+.fe-arbitrage-view thead th,
+.fe-arb-page thead,
+.fe-arb-page thead tr,
+.fe-arb-page thead th {
+  border-color: #FFFFFF !important;
+}
+
+.fe-arbitrage-view thead th,
+.fe-arb-page thead th {
+  color: #FFFFFF !important;
+  font-weight: 700 !important;
+  border-bottom: 2px solid #FFFFFF !important;
+}
+
+.fe-arbitrage-view tbody tr,
+.fe-arb-page tbody tr {
+  border-bottom: 1.5px solid #FFFFFF !important;
+}
+
+/* Divisórias */
+.fe-arbitrage-view hr,
+.fe-arb-page hr {
+  border: 0 !important;
+  border-top: 2px solid #FFFFFF !important;
+  opacity: 1 !important;
+}
+
+.fe-arbitrage-view [class*="divider"],
+.fe-arbitrage-view [class*="separator"],
+.fe-arb-page [class*="divider"],
+.fe-arb-page [class*="separator"] {
+  border-color: #FFFFFF !important;
+  background-color: #FFFFFF !important;
+  opacity: 1 !important;
+}
+
+/* Mantém cores semânticas importantes */
+.fe-arbitrage-view [class*="success"],
+.fe-arbitrage-view [class*="online"],
+.fe-arbitrage-view [class*="profit"],
+.fe-arbitrage-view [class*="warning"],
+.fe-arbitrage-view [class*="danger"],
+.fe-arbitrage-view [class*="active"],
+.fe-arb-page [class*="success"],
+.fe-arb-page [class*="online"],
+.fe-arb-page [class*="profit"],
+.fe-arb-page [class*="warning"],
+.fe-arb-page [class*="danger"],
+.fe-arb-page [class*="active"] {
+  opacity: 1 !important;
+}
+
+/* Foco premium */
+.fe-arbitrage-view button:focus-visible,
+.fe-arbitrage-view select:focus-visible,
+.fe-arbitrage-view input:focus-visible,
+.fe-arb-page button:focus-visible,
+.fe-arb-page select:focus-visible,
+.fe-arb-page input:focus-visible {
+  outline: 3px solid #FFFFFF !important;
+  outline-offset: 2px !important;
+}
